@@ -3,6 +3,11 @@ RandPunkt Journal — Editorial panel: coauthor approval management.
 
 Reads and writes CSVs on the remote server. Uses SSH key authentication.
 Supports both articles (RP-*) and books (BK-*).
+
+The CSV of manuscripts/books now includes two extra columns:
+    idioma_original, formato_original
+which are used to inform the editor about the original language and
+format of each item (so they can plan translation and LaTeX conversion).
 """
 
 import io
@@ -34,6 +39,7 @@ st.set_page_config(
 COLS_ARTICULOS = [
     "articulo_id", "tipo", "titulo", "ruta_pdf", "ruta_cover",
     "fecha_creacion", "estado", "isbn", "motivo_retiro", "fecha_retiro",
+    "idioma_original", "formato_original",
 ]
 COLS_CONFIRMACIONES = [
     "articulo_id", "nombre", "email", "token",
@@ -503,6 +509,15 @@ def editor_view():
             f"**Title:** {art_row['titulo']}  \n"
             f"**Status:** `{art_row['estado']}`"
         )
+
+        # Show original language and format if available
+        idioma = art_row.get("idioma_original", "")
+        formato = art_row.get("formato_original", "")
+        if idioma or formato:
+            st.info(
+                f"**Original language:** {idioma or '—'}  \n"
+                f"**Original format:** {formato or '—'}"
+            )
 
         df_conf_existing = read_confirmations()
         existing = df_conf_existing[

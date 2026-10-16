@@ -8,6 +8,10 @@ Architecture:
 - Possible states:
     en_revision, aceptado, todos_aprobados, publicado, retirado
 - Retired manuscripts are NOT deleted, only marked as retired.
+
+The catalog CSV now includes two extra columns:
+    idioma_original, formato_original
+which are captured from the journal JSON when importing.
 """
 
 import io
@@ -37,6 +41,7 @@ st.set_page_config(
 COLS_ARTICULOS = [
     "articulo_id", "tipo", "titulo", "ruta_pdf", "ruta_cover",
     "fecha_creacion", "estado", "isbn", "motivo_retiro", "fecha_retiro",
+    "idioma_original", "formato_original",
 ]
 COLS_REVISORES = [
     "articulo_id", "titulo", "nombre_revisor", "email_revisor",
@@ -297,6 +302,8 @@ def import_from_revista() -> tuple[int, list]:
                 "isbn": "",
                 "motivo_retiro": "",
                 "fecha_retiro": "",
+                "idioma_original": data.get("original_language", ""),
+                "formato_original": data.get("original_format", ""),
             })
 
         # Books
@@ -315,6 +322,8 @@ def import_from_revista() -> tuple[int, list]:
                 "isbn": data.get("isbn", ""),
                 "motivo_retiro": "",
                 "fecha_retiro": "",
+                "idioma_original": data.get("original_language", ""),
+                "formato_original": data.get("original_format", ""),
             })
 
         if new_rows:
@@ -489,6 +498,8 @@ def tab_articles():
             with c2:
                 new_year = st.number_input("Year", min_value=1900, max_value=2100, value=2026)
                 new_author = st.text_input("Author(s)")
+                new_idioma = st.selectbox("Original language", ["Spanish", "English"])
+                new_formato = st.selectbox("Original format", ["LaTeX", "Microsoft Word"])
             new_desc = st.text_area("Description", height=80)
             submitted = st.form_submit_button("➕ Add book", use_container_width=True)
 
@@ -511,6 +522,8 @@ def tab_articles():
                         "isbn": new_isbn.strip(),
                         "motivo_retiro": "",
                         "fecha_retiro": "",
+                        "idioma_original": new_idioma,
+                        "formato_original": new_formato,
                     }
                     df_art = pd.concat([df_art, pd.DataFrame([new_row])], ignore_index=True)
                     if save_articles(df_art):
@@ -539,7 +552,10 @@ def tab_articles():
 
     st.markdown(f"### {len(df_art)} result(s)")
     st.dataframe(
-        df_art[["articulo_id", "tipo", "titulo", "estado", "isbn"]],
+        df_art[[
+            "articulo_id", "tipo", "titulo", "estado",
+            "idioma_original", "formato_original", "isbn",
+        ]],
         use_container_width=True,
     )
     download_csv_button(
@@ -562,6 +578,8 @@ def tab_articles():
                 st.write(f"**Title:** {row['titulo']}")
                 if row["tipo"] == "libro" and row["isbn"]:
                     st.write(f"**ISBN:** {row['isbn']}")
+                st.write(f"**Original language:** {row['idioma_original'] or '—'}")
+                st.write(f"**Original format:** {row['formato_original'] or '—'}")
                 st.write(f"**Creation date:** {row['fecha_creacion']}")
                 st.write(f"**Status:** `{row['estado']}`")
                 if row["motivo_retiro"]:
