@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:ev="http://www.w3.org/2001/xml-events" xmlns:xlink="http://www.w3.org/1999/xlink" baseProfile="full" height="700px" version="1.1" viewBox="0 0 2000 700" width="2000px">
+  <rect x="0" y="0" width="2000" height="700" fill="#1B2A4A"/>
+  <defs/>
+  <text fill="#FFFFFF" font-family="Playfair Display" font-size="340" font-weight="normal" text-anchor="middle" x="1000" y="385">RandPunkt</text>
+  <text fill="#FFFFFF" font-family="Playfair Display" font-size="120" font-weight="normal" text-anchor="middle" x="1000" y="555" letter-spacing="25">Journal</text>
+</svg>
