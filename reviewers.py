@@ -725,10 +725,41 @@ def tab_articles():
             if df_ver.empty:
                 st.info("No versions uploaded yet.")
             else:
-                st.dataframe(
-                    df_ver[["fecha", "nombre_archivo", "notas"]],
-                    use_container_width=True,
-                )
+                # --- NUEVA LÓGICA DE DESCARGA ---
+                for _, v_row in df_ver.iterrows():
+                    filename = v_row["nombre_archivo"]
+                    # Ruta completa en el servidor del panel de revisores
+                    remote_path = f"{st.secrets['remote_server']['dir'].rstrip('/')}/versiones/{filename}"
+                    
+                    st.write(f"📄 **{filename}** ({v_row['fecha'][:10]})")
+                    st.write(f"Notas: {v_row['notas']}")
+                    
+                    # Intentar descargar el archivo vía SFTP
+                    try:
+                        transport, sftp = _sftp_connect()
+                        with sftp.open(remote_path, "rb") as f:
+                            file_bytes = f.read()
+                        sftp.close()
+                        transport.close()
+                        
+                        # Determinar MIME type según la extensión
+                        if filename.endswith(".zip"):
+                            mime = "application/zip"
+                        elif filename.endswith(".pdf"):
+                            mime = "application/pdf"
+                        else:
+                            mime = "application/octet-stream"
+
+                        st.download_button(
+                            label=f"⬇️ Download {filename}",
+                            data=file_bytes,
+                            file_name=filename,
+                            mime=mime,
+                            key=f"dl_{aid}_{filename}"
+                        )
+                    except Exception as e:
+                        st.error(f"No se pudo cargar el archivo: {e}")
+                # ---------------------------------
 
 # ============================================================
 # TAB 2: REVIEWERS
