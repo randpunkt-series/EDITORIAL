@@ -201,7 +201,7 @@ def append_log(action: str, articulo_id: str, detail: str = ""):
         print(f"[LOG] Could not write to log: {e}")
 
 # ============================================================
-# IMPORT FROM JOURNAL
+# IMPORT FROM JOURNAL (CON DESCARGA DE ARCHIVOS)
 # ============================================================
 def _read_json_remote(sftp, path: str) -> dict | None:
     try:
@@ -218,69 +218,145 @@ def import_from_revista() -> tuple[int, list]:
     try:
         transport, sftp = _sftp_connect()
 
+        # Carpetas de origen en randpunkt.org
+        revista_base = rs['revista_dir'].rstrip('/')
+        metadata_dir = f"{revista_base}/METADATA"
+        
+        # IMPORTANTE: Carpetas en singular (PDF y ZIP)
+        pdf_dir = f"{revista_base}/PDF" 
+        zip_dir = f"{revista_base}/ZIP"
+        
+        # Carpeta destino en el servidor del panel de revisores
+        versions_dir = f"{rs['dir'].rstrip('/')}/versiones"
+        _ensure_remote_dir(sftp, versions_dir)
+
         submissions = []
-        metadata_dir = f"{rs['revista_dir'].rstrip('/')}/METADATA"
         try:
             for fname in sorted(sftp.listdir(metadata_dir)):
                 if not fname.endswith(".json"):
                     continue
                 data = _read_json_remote(sftp, f"{metadata_dir}/{fname}")
                 if data:
-                    submissions.append(("articulo", data))
+                    submissions.append(data)
         except FileNotFoundError:
             pass
 
         books = []
-        books_meta_dir = f"{rs['revista_dir'].rstrip('/')}/BOOKS/metadata"
+        books_meta_dir = f"{revista_base}/BOOKS/metadata"
         try:
             for fname in sorted(sftp.listdir(books_meta_dir)):
                 if not fname.endswith(".json"):
                     continue
                 data = _read_json_remote(sftp, f"{books_meta_dir}/{fname}")
                 if data:
-                    books.append(("libro", data))
+                    books.append(data)
         except FileNotFoundError:
             pass
 
-        sftp.close()
-        transport.close()
-
         df_art = read_articles()
+        df_ver = read_versions()
         existing_ids = set(df_art["articulo_id"].tolist()) if not df_art.empty else set()
 
-        new_rows = []
+        new_art_rows = []
+        new_ver_rows = []
 
-        for tipo, data in submissions:
+        # --- PROCESAR ARTÍCULOS ---
+        for data in submissions:
             art_id = data.get("tracking_id", "")
-            if not art_id or art_id in existing_ids:
+            if not art_id:
                 continue
-            versions = data.get("versions", [{}])
+                
+            is_new = art_id not in existing_ids
+            needs_files = False
+            if not is_new:
+                existing_ver = df_ver[df_ver["articulo_id"] == art_id]
+                if existing_ver.empty:
+                    needs_files = True
+            
+            if not is_new and not needs_files:
+                continue
+            
+            versions = data.get("versions", [])
             fecha = versions[0].get("submitted_at", "") if versions else ""
-            new_rows.append({
-                "articulo_id": art_id,
-                "tipo": "articulo",
-                "titulo": data.get("titulo", ""),
-                "ruta_pdf": "",
-                "ruta_cover": "",
-                "fecha_creacion": fecha,
-                "estado": "en_revision",
-                "isbn": "",
-                "motivo_retiro": "",
-                "fecha_retiro": "",
-                "idioma_original": data.get("original_language", ""),
-                "formato_original": data.get("original_format", ""),
-                "editor_asignado": "",
-            })
+            
+            raw_pdf_name = versions[0].get("pdf", "") if versions else ""
+            raw_zip_name = versions[0].get("supplementary_zip", "") if versions else ""
+            
+            pdf_filename = os.path.basename(raw_pdf_name) if raw_pdf_name else ""
+            zip_filename = os.path.basename(raw_zip_name) if raw_zip_name else ""
 
-        for tipo, data in books:
+            remote_pdf_src = f"{pdf_dir}/{pdf_filename}" if pdf_filename else ""
+            remote_zip_src = f"{zip_dir}/{zip_filename}" if zip_filename else ""
+            
+            # COPIAR EL PDF Y ZIP
+            if remote_pdf_src:
+                try:
+                    sftp.stat(remote_pdf_src)
+                    dest_pdf = f"{versions_dir}/{pdf_filename}"
+                    sftp.get(remote_pdf_src, dest_pdf)
+                except Exception as e:
+                    print(f"Error copiando PDF {pdf_filename}: {e}")
+                    errors.append(f"Could not copy PDF for {art_id}")
+
+            if remote_zip_src:
+                try:
+                    sftp.stat(remote_zip_src)
+                    dest_zip = f"{versions_dir}/{zip_filename}"
+                    sftp.get(remote_zip_src, dest_zip)
+                except Exception as e:
+                    print(f"Error copiando ZIP {zip_filename}: {e}")
+                    errors.append(f"Could not copy ZIP for {art_id}")
+
+            if is_new:
+                new_art_rows.append({
+                    "articulo_id": art_id,
+                    "tipo": "articulo",
+                    "titulo": data.get("titulo", ""),
+                    "ruta_pdf": f"versiones/{pdf_filename}" if pdf_filename else "",
+                    "ruta_cover": "",
+                    "fecha_creacion": fecha,
+                    "estado": "en_revision",
+                    "isbn": "",
+                    "motivo_retiro": "",
+                    "fecha_retiro": "",
+                    "idioma_original": data.get("original_language", ""),
+                    "formato_original": data.get("original_format", ""),
+                    "editor_asignado": "",
+                })
+
+            if pdf_filename:
+                new_ver_rows.append({
+                    "articulo_id": art_id,
+                    "fecha": fecha,
+                    "ruta_pdf": f"versiones/{pdf_filename}",
+                    "nombre_archivo": pdf_filename,
+                    "notas": "Initial submission (imported)",
+                })
+
+        # --- PROCESAR LIBROS ---
+        for data in books:
             book_id = data.get("id", "")
             if not book_id or book_id in existing_ids:
                 continue
-            new_rows.append({
+            
+            raw_pdf_name = data.get("pdf", "")
+            pdf_filename = os.path.basename(raw_pdf_name) if raw_pdf_name else ""
+            
+            remote_pdf_src = f"{revista_base}/BOOKS/pdfs/{pdf_filename}" if pdf_filename else ""
+
+            if remote_pdf_src:
+                try:
+                    sftp.stat(remote_pdf_src)
+                    dest_pdf = f"{versions_dir}/{pdf_filename}"
+                    sftp.get(remote_pdf_src, dest_pdf)
+                except Exception as e:
+                    print(f"Error copiando libro PDF {pdf_filename}: {e}")
+
+            new_art_rows.append({
                 "articulo_id": book_id,
                 "tipo": "libro",
                 "titulo": data.get("title", ""),
-                "ruta_pdf": "",
+                "ruta_pdf": f"versiones/{pdf_filename}" if pdf_filename else "",
                 "ruta_cover": "",
                 "fecha_creacion": data.get("created_at", ""),
                 "estado": "en_revision",
@@ -292,13 +368,31 @@ def import_from_revista() -> tuple[int, list]:
                 "editor_asignado": "",
             })
 
-        if new_rows:
-            df_new = pd.DataFrame(new_rows)
-            df_art = pd.concat([df_art, df_new], ignore_index=True)
+            if pdf_filename:
+                new_ver_rows.append({
+                    "articulo_id": book_id,
+                    "fecha": data.get("created_at", ""),
+                    "ruta_pdf": f"versiones/{pdf_filename}",
+                    "nombre_archivo": pdf_filename,
+                    "notas": "Initial book file (imported)",
+                })
+
+        # Guardar cambios
+        if new_art_rows:
+            df_new_art = pd.DataFrame(new_art_rows)
+            df_art = pd.concat([df_art, df_new_art], ignore_index=True)
             if save_articles(df_art):
-                imported = len(new_rows)
-                for r in new_rows:
+                imported = len(new_art_rows)
+                for r in new_art_rows:
                     append_log("IMPORT", r["articulo_id"], r["titulo"])
+
+        if new_ver_rows:
+            df_new_ver = pd.DataFrame(new_ver_rows)
+            df_ver = pd.concat([df_ver, df_new_ver], ignore_index=True)
+            save_versions(df_ver)
+
+        sftp.close()
+        transport.close()
 
         return imported, errors
 

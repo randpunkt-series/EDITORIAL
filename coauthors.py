@@ -41,6 +41,9 @@ COLS_CONFIRMACIONES = [
     "aprobado", "fecha_aprobacion", "comentarios",
 ]
 COLS_COAUTORES = ["Nombre", "Email"]
+COLS_VERSIONES = [
+    "articulo_id", "fecha", "ruta_pdf", "nombre_archivo", "notas",
+]
 
 # ============================================================
 # SFTP LAYER
@@ -143,6 +146,9 @@ def read_articles() -> pd.DataFrame:
 
 def read_confirmations() -> pd.DataFrame:
     return read_remote_csv(st.secrets["csv"]["confirmaciones_file"], COLS_CONFIRMACIONES)
+
+def read_versions() -> pd.DataFrame:
+    return read_remote_csv(st.secrets["csv"]["versiones_file"], COLS_VERSIONES)
 
 def save_articles(df: pd.DataFrame) -> bool:
     return save_remote_csv(st.secrets["csv"]["articulos_file"], df)
@@ -685,6 +691,41 @@ def author_view(token: str):
     )
     st.markdown(f"### {art['titulo']}")
     st.caption(f"Editorial reference: {article_id}")
+
+    # --- MOSTRAR EL PDF PARA DESCARGA ---
+    st.markdown("### Manuscript File")
+    df_ver = read_versions()
+    versions_for_art = df_ver[df_ver["articulo_id"] == article_id]
+    
+    if versions_for_art.empty:
+        st.warning("⚠️ No manuscript file has been uploaded yet.")
+    else:
+        # Tomar la versión más reciente (ordenada por fecha descendente)
+        latest_version = versions_for_art.sort_values("fecha", ascending=False).iloc[0]
+        pdf_filename = latest_version["nombre_archivo"]
+        
+        # Intentar leer el archivo desde el servidor SFTP
+        try:
+            transport, sftp = _sftp_connect()
+            versions_dir = f"{st.secrets['remote_server']['dir'].rstrip('/')}/versiones"
+            remote_path = f"{versions_dir}/{pdf_filename}"
+            
+            with sftp.open(remote_path, "rb") as f:
+                pdf_bytes = f.read()
+                
+            sftp.close()
+            transport.close()
+            
+            st.download_button(
+                label="⬇️ Download Manuscript (PDF)",
+                data=pdf_bytes,
+                file_name=pdf_filename,
+                mime="application/pdf",
+                use_container_width=True,
+            )
+            
+        except Exception as e:
+            st.error(f"Could not load the manuscript file: {e}")
 
     row = df_conf[
         (df_conf["articulo_id"] == article_id)
