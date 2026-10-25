@@ -12,6 +12,8 @@ import zipfile
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email import encoders
 from datetime import date, datetime
 from io import StringIO, BytesIO
 
@@ -108,7 +110,7 @@ def _cleanup_old_backups(sftp, base_name: str, keep_days: int = 30):
 # ============================================================
 # EMAIL
 # ============================================================
-def _send_email(recipient: str, subject: str, body: str) -> bool:
+def _send_email(recipient: str, subject: str, body: str, attachment_bytes: bytes = None, attachment_name: str = None) -> bool:
     try:
         cfg = st.secrets.get("email", {})
         if not cfg.get("smtp_server"):
@@ -121,6 +123,13 @@ def _send_email(recipient: str, subject: str, body: str) -> bool:
         msg["Subject"] = subject
         msg.attach(MIMEText(body, "plain", "utf-8"))
 
+        if attachment_bytes and attachment_name:
+            part = MIMEBase("application", "octet-stream")
+            part.set_payload(attachment_bytes)
+            encoders.encode_base64(part)
+            part.add_header("Content-Disposition", f"attachment; filename={attachment_name}")
+            msg.attach(part)
+
         server = smtplib.SMTP(cfg["smtp_server"], int(cfg["smtp_port"]))
         server.starttls()
         server.login(cfg["sender_email"], cfg["sender_password"])
@@ -131,23 +140,16 @@ def _send_email(recipient: str, subject: str, body: str) -> bool:
         print(f"[ERROR] No se pudo enviar correo a {recipient}: {e}")
         return False
 
-def notify_editor_assignment(editor_login: str, articulo_id: str, titulo: str, editor_email: str):
-    subject = f"[RandPunkt] Nuevo manuscrito asignado: {articulo_id}"
-    body = f"""Estimado/a {editor_login},
+def notify_generic(recipient_email: str, recipient_name: str, subject: str, mensaje: str, attachment_bytes: bytes = None, attachment_name: str = None):
+    body = f"""Estimado/a {recipient_name},
 
-Se le ha asignado el siguiente manuscrito para su revisión editorial:
-
-ID: {articulo_id}
-Título: {titulo}
-
-Puede acceder al panel de revisores para descargar los archivos y gestionar la revisión:
-https://randpunkt-revisores.streamlit.app
+{mensaje}
 
 Saludos cordiales,
-Editor en Jefe
+Comité Editorial
 RandPunkt Journal
 """
-    return _send_email(editor_email, subject, body)
+    return _send_email(recipient_email, subject, body, attachment_bytes, attachment_name)
 
 # ============================================================
 # CSV READ/WRITE
@@ -404,35 +406,66 @@ def import_from_revista() -> tuple[int, list]:
 # ============================================================
 # UPLOAD VERSION
 # ============================================================
-def upload_version(articulo_id: str, file_bytes: bytes, original_name: str, notas: str) -> tuple[bool, str]:
+def upload_version(articulo_id: str, pdf_bytes: bytes, zip_bytes: bytes, pdf_name: str, zip_name: str, notas: str) -> tuple[bool, str]:
     try:
         transport, sftp = _sftp_connect()
         versions_dir = f"{st.secrets['remote_server']['dir'].rstrip('/')}/versiones"
         _ensure_remote_dir(sftp, versions_dir)
+        
+        submission_data = get_submission(articulo_id)
+        if not submission_data:
+            return False, "No se encontró el JSON de metadatos."
+        
+        current_version = submission_data.get("current_version", 1)
+        next_version = current_version + 1
+        
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", original_name)
-        remote_name = f"{articulo_id}_{ts}_{safe_name}"
-        remote_path = f"{versions_dir}/{remote_name}"
+        safe_pdf = re.sub(r"[^A-Za-z0-9._-]", "_", pdf_name)
+        safe_zip = re.sub(r"[^A-Za-z0-9._-]", "_", zip_name)
+        
+        pdf_remote_name = f"{articulo_id}_v{next_version}_{ts}_{safe_pdf}"
+        zip_remote_name = f"{articulo_id}_v{next_version}_{ts}_{safe_zip}"
+        
+        pdf_remote_path = f"{versions_dir}/{pdf_remote_name}"
+        zip_remote_path = f"{versions_dir}/{zip_remote_name}"
 
-        with sftp.open(remote_path, "wb") as f:
-            f.write(file_bytes)
+        with sftp.open(pdf_remote_path, "wb") as f:
+            f.write(pdf_bytes)
+        with sftp.open(zip_remote_path, "wb") as f:
+            f.write(zip_bytes)
 
-        sftp.close()
-        transport.close()
+        submission_data["current_version"] = next_version
+        submission_data["versions"].append({
+            "version": next_version,
+            "submitted_at": datetime.now().isoformat(timespec="seconds"),
+            "pdf": pdf_remote_name,
+            "supplementary_zip": zip_remote_name,
+            "notes": notas or f"Version {next_version} uploaded by editor",
+        })
+        
+        rs = st.secrets["remote_server"]
+        revista_base = rs['revista_dir'].rstrip('/')
+        json_path = f"{revista_base}/METADATA/{articulo_id}.json"
+        
+        with sftp.open(json_path, "w") as f:
+            f.write(json.dumps(submission_data, indent=2).encode("utf-8"))
 
         df_ver = read_versions()
         new_row = {
             "articulo_id": articulo_id,
             "fecha": datetime.now().isoformat(timespec="seconds"),
-            "ruta_pdf": f"versiones/{remote_name}",
-            "nombre_archivo": remote_name,
-            "notas": notas,
+            "ruta_pdf": f"versiones/{pdf_remote_name}",
+            "nombre_archivo": pdf_remote_name,
+            "notas": notas or f"Version {next_version} uploaded by editor",
         }
         df_ver = pd.concat([df_ver, pd.DataFrame([new_row])], ignore_index=True)
         save_versions(df_ver)
 
-        append_log("UPLOAD", articulo_id, f"{remote_name} — {notas}")
-        return True, remote_name
+        sftp.close()
+        transport.close()
+
+        append_log("UPLOAD", articulo_id, f"v{next_version} — {pdf_remote_name} + {zip_remote_name} — {notas}")
+        return True, f"v{next_version}"
     except Exception as e:
         return False, str(e)
 
@@ -492,6 +525,11 @@ def download_csv_button(df: pd.DataFrame, filename: str, label: str):
 # ============================================================
 def tab_articles():
     st.subheader("📚 Manuscripts and books")
+
+    # Mostrar mensaje de éxito si existe en la sesión
+    if "success_message" in st.session_state:
+        st.success(st.session_state["success_message"])
+        del st.session_state["success_message"]
 
     user_level = st.session_state.get('editor_level', 1)
     user_login = st.session_state.get('editor_login', '')
@@ -615,6 +653,16 @@ def tab_articles():
                 if row["fecha_retiro"]:
                     st.write(f"**Retirement date:** {row['fecha_retiro']}")
 
+                if user_level == 1:
+                    submission_data = get_submission(aid)
+                    if submission_data:
+                        author = submission_data.get("corresponding_author", {})
+                        st.markdown("---")
+                        st.markdown("**Contacto del Autor (Solo para el Editor)**")
+                        st.write(f"**Nombre:** {author.get('name', '—')}")
+                        st.write(f"**Email:** `{author.get('email', '—')}`")
+                        st.write(f"**Afiliación:** {author.get('affiliation', '—')}")
+
                 if user_level == 0:
                     st.markdown("---")
                     st.markdown("**Assign editor**")
@@ -642,47 +690,43 @@ def tab_articles():
                         
                         if save_articles(df_full):
                             append_log("ASSIGN-EDITOR", aid, f"Assigned to {new_val or 'none'}")
-                            
-                            # --- ENVÍO DE CORREO AL EDITOR ---
-                            if new_val:
-                                df_ed = read_editores()
-                                match = df_ed[df_ed["login"] == new_val]
-                                if not match.empty:
-                                    editor_email = match.iloc[0]["email"]
-                                    ok = notify_editor_assignment(new_val, aid, row["titulo"], editor_email)
-                                    if ok:
-                                        st.success(f"Asignación guardada y correo enviado a {new_val} ({editor_email}).")
-                                    else:
-                                        st.warning(f"Asignación guardada, pero falló el envío del correo a {new_val}.")
-                                else:
-                                    st.warning(f"Asignación guardada, pero no se encontró el correo de {new_val} en registro_editores.csv.")
-                            else:
-                                st.success("Assignment updated.")
+                            st.success("Assignment updated.")
                             st.rerun()
 
             with c2:
                 st.write("**Actions**")
 
                 with st.form(f"upload_version_{aid}_{idx}"):
-                    file = st.file_uploader(
-                        "Upload version (PDF)",
+                    st.markdown("**Upload new version (PDF + ZIP)**")
+                    pdf_file = st.file_uploader(
+                        "PDF",
                         type=["pdf"],
-                        key=f"file_{aid}_{idx}",
+                        key=f"pdf_file_{aid}_{idx}",
+                    )
+                    zip_file = st.file_uploader(
+                        "Supplementary ZIP",
+                        type=["zip"],
+                        key=f"zip_file_{aid}_{idx}",
                     )
                     notas = st.text_input(
                         "Version notes",
                         value="",
                         key=f"notas_{aid}_{idx}",
                     )
-                    if st.form_submit_button("⬆️ Upload", use_container_width=True):
-                        if file is None:
-                            st.error("Select a PDF.")
+                    if st.form_submit_button("⬆️ Upload Version", use_container_width=True):
+                        if pdf_file is None or zip_file is None:
+                            st.error("Debe seleccionar tanto el PDF como el ZIP.")
                         else:
                             ok, result = upload_version(
-                                aid, file.getbuffer(), file.name, notas.strip()
+                                aid,
+                                pdf_file.getbuffer(),
+                                zip_file.getbuffer(),
+                                pdf_file.name,
+                                zip_file.name,
+                                notas.strip()
                             )
                             if ok:
-                                st.success(f"Uploaded: {result}")
+                                st.success(f"Versión {result} subida correctamente.")
                                 st.rerun()
                             else:
                                 st.error(f"Error: {result}")
@@ -733,6 +777,41 @@ def tab_articles():
                             st.success("Restored.")
                             st.rerun()
 
+            # --- BOTÓN PARA ENVIAR CORREO AL EDITOR ASOCIADO (Jefe) ---
+            if user_level == 0 and row["editor_asignado"]:
+                if st.button(f"📧 Enviar correo a {row['editor_asignado']}", key=f"email_editor_{aid}", use_container_width=True):
+                    st.session_state[f"emailing_editor_{aid}"] = True
+
+                if st.session_state.get(f"emailing_editor_{aid}", False):
+                    with st.form(f"email_editor_form_{aid}"):
+                        df_ed = read_editores()
+                        match = df_ed[df_ed["login"] == row["editor_asignado"]]
+                        editor_email = match.iloc[0]["email"] if not match.empty else ""
+                        
+                        st.markdown(f"**Enviar correo a:** {row['editor_asignado']} <{editor_email}>")
+                        asunto = st.text_input("Asunto", value=f"Asignación: {aid} — {row['titulo']}")
+                        mensaje = st.text_area("Mensaje", height=150, placeholder="Escriba su mensaje aquí...")
+                        
+                        cc1, cc2 = st.columns(2)
+                        with cc1:
+                            if st.form_submit_button("📧 Enviar", use_container_width=True):
+                                if not mensaje.strip():
+                                    st.error("El mensaje no puede estar vacío.")
+                                elif not editor_email:
+                                    st.error("No se encontró el correo del editor.")
+                                else:
+                                    ok = notify_generic(editor_email, row["editor_asignado"], asunto, mensaje.strip())
+                                    if ok:
+                                        st.success(f"Correo enviado a {editor_email}.")
+                                        st.session_state[f"emailing_editor_{aid}"] = False
+                                        st.rerun()
+                                    else:
+                                        st.error("Error al enviar el correo.")
+                        with cc2:
+                            if st.form_submit_button("❌ Cancelar", use_container_width=True):
+                                st.session_state[f"emailing_editor_{aid}"] = False
+                                st.rerun()
+
             st.markdown("**Version history & Downloads**")
             
             rs = st.secrets["remote_server"]
@@ -741,96 +820,153 @@ def tab_articles():
             
             submission_data = get_submission(aid)
             if submission_data and "versions" in submission_data and len(submission_data["versions"]) > 0:
-                pdf_filename = submission_data["versions"][0].get("pdf", "")
-                zip_filename = submission_data["versions"][0].get("supplementary_zip", "")
+                versions_list = submission_data["versions"]
                 
-                col_dl1, col_dl2 = st.columns(2)
+                st.markdown("Seleccione la versión que desea empaquetar:")
                 
-                if pdf_filename:
-                    try:
-                        transport, sftp = _sftp_connect()
-                        with sftp.open(f"{revista_base}/PDF/{pdf_filename}", "rb") as f:
-                            pdf_bytes = f.read()
-                        sftp.close()
-                        transport.close()
-                        col_dl1.download_button(
-                            label=f"⬇️ Download PDF Original",
-                            data=pdf_bytes,
-                            file_name=pdf_filename,
-                            mime="application/pdf",
-                            key=f"dl_pdf_{aid}"
-                        )
-                    except Exception as e:
-                        col_dl1.error(f"PDF no disponible.")
+                selected_pdf = None
+                selected_zip = None
+                selected_version_num = 1
                 
-                if zip_filename:
-                    try:
-                        transport, sftp = _sftp_connect()
-                        with sftp.open(f"{revista_base}/ZIP/{zip_filename}", "rb") as f:
-                            zip_bytes = f.read()
-                        sftp.close()
-                        transport.close()
-                        col_dl2.download_button(
-                            label=f"⬇️ Download ZIP Original",
-                            data=zip_bytes,
-                            file_name=zip_filename,
-                            mime="application/zip",
-                            key=f"dl_zip_{aid}"
-                        )
-                    except Exception as e:
-                        col_dl2.error(f"ZIP no disponible.")
+                for i, ver in enumerate(versions_list):
+                    v_num = ver.get("version", i + 1)
+                    v_pdf = ver.get("pdf", "")
+                    v_zip = ver.get("supplementary_zip", "")
+                    v_date = ver.get("submitted_at", "")[:10]
+                    v_notes = ver.get("notes", "")
+                    
+                    st.markdown(f"**Versión v{v_num}** ({v_date}) - {v_notes}")
+                    
+                    col_pdf, col_zip = st.columns(2)
+                    
+                    if v_pdf:
+                        with col_pdf:
+                            if st.button(f"⬇️ Descargar PDF v{v_num}", key=f"btn_pdf_{aid}_{v_num}"):
+                                with st.spinner(f"Cargando PDF v{v_num}..."):
+                                    try:
+                                        transport, sftp = _sftp_connect()
+                                        for path in [f"{revista_base}/PDF/{v_pdf}", f"{versions_dir}/{v_pdf}"]:
+                                            try:
+                                                with sftp.open(path, "rb") as f:
+                                                    pdf_bytes = f.read()
+                                                st.download_button(
+                                                    label=f"Guardar PDF v{v_num}",
+                                                    data=pdf_bytes,
+                                                    file_name=v_pdf,
+                                                    mime="application/pdf",
+                                                    key=f"dl_pdf_{aid}_{v_num}"
+                                                )
+                                                break
+                                            except:
+                                                continue
+                                        sftp.close()
+                                        transport.close()
+                                    except Exception as e:
+                                        st.error(f"Error al cargar PDF: {e}")
+                    
+                    if v_zip:
+                        with col_zip:
+                            if st.button(f"⬇️ Descargar ZIP v{v_num}", key=f"btn_zip_{aid}_{v_num}"):
+                                with st.spinner(f"Cargando ZIP v{v_num}..."):
+                                    try:
+                                        transport, sftp = _sftp_connect()
+                                        for path in [f"{revista_base}/ZIP/{v_zip}", f"{versions_dir}/{v_zip}"]:
+                                            try:
+                                                with sftp.open(path, "rb") as f:
+                                                    zip_bytes = f.read()
+                                                st.download_button(
+                                                    label=f"Guardar ZIP v{v_num}",
+                                                    data=zip_bytes,
+                                                    file_name=v_zip,
+                                                    mime="application/zip",
+                                                    key=f"dl_zip_{aid}_{v_num}"
+                                                )
+                                                break
+                                            except:
+                                                continue
+                                        sftp.close()
+                                        transport.close()
+                                    except Exception as e:
+                                        st.error(f"Error al cargar ZIP: {e}")
+                    
+                    if st.radio(
+                        f"Seleccionar v{v_num} para empaquetar",
+                        options=["No", "Sí"],
+                        index=0,
+                        key=f"select_v{v_num}_{aid}",
+                        horizontal=True
+                    ) == "Sí":
+                        selected_pdf = v_pdf
+                        selected_zip = v_zip
+                        selected_version_num = v_num
 
-            st.divider()
-            st.markdown("**Generate Edition Package**")
-            st.caption("Creates a ZIP file in /versiones/ containing both the PDF and the supplementary ZIP.")
-            
-            if st.button(f"📦 Generar Paquete v1 para {aid}", key=f"gen_v1_{aid}", use_container_width=True):
-                if not pdf_filename or not zip_filename:
-                    st.error("No se encontraron los archivos originales para empaquetar.")
+                st.divider()
+                st.markdown("**Generate Edition Package**")
+                st.caption("Crea un ZIP en /versiones/ con el PDF y el ZIP de la versión seleccionada.")
+                
+                if selected_pdf and selected_zip:
+                    st.info(f"Versión seleccionada: v{selected_version_num}")
+                    
+                    if st.button(f"📦 Generar Paquete v{selected_version_num} para {aid}", key=f"gen_pkg_{aid}", use_container_width=True):
+                        with st.spinner("Empaquetando archivos..."):
+                            try:
+                                transport, sftp = _sftp_connect()
+                                
+                                pdf_data = None
+                                for path in [f"{revista_base}/PDF/{selected_pdf}", f"{versions_dir}/{selected_pdf}"]:
+                                    try:
+                                        with sftp.open(path, "rb") as f:
+                                            pdf_data = f.read()
+                                        break
+                                    except:
+                                        continue
+                                
+                                zip_data = None
+                                for path in [f"{revista_base}/ZIP/{selected_zip}", f"{versions_dir}/{selected_zip}"]:
+                                    try:
+                                        with sftp.open(path, "rb") as f:
+                                            zip_data = f.read()
+                                        break
+                                    except:
+                                        continue
+                                
+                                if not pdf_data or not zip_data:
+                                    st.error("No se pudieron leer los archivos de la versión seleccionada.")
+                                else:
+                                    package_buffer = BytesIO()
+                                    with zipfile.ZipFile(package_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+                                        zf.writestr(selected_pdf, pdf_data)
+                                        zf.writestr(selected_zip, zip_data)
+                                    
+                                    package_filename = f"{aid}_v{selected_version_num}_package.zip"
+                                    remote_package_path = f"{versions_dir}/{package_filename}"
+                                    
+                                    _ensure_remote_dir(sftp, versions_dir)
+                                    
+                                    with sftp.open(remote_package_path, "wb") as f:
+                                        f.write(package_buffer.getvalue())
+                                    
+                                    df_ver = read_versions()
+                                    new_ver_row = {
+                                        "articulo_id": aid,
+                                        "fecha": datetime.now().isoformat(timespec="seconds"),
+                                        "ruta_pdf": f"versiones/{package_filename}",
+                                        "nombre_archivo": package_filename,
+                                        "notas": f"Version v{selected_version_num} package generated",
+                                    }
+                                    df_ver = pd.concat([df_ver, pd.DataFrame([new_ver_row])], ignore_index=True)
+                                    save_versions(df_ver)
+                                    
+                                    append_log("GENERATE_PACKAGE", aid, package_filename)
+                                    st.session_state["success_message"] = f"¡Paquete {package_filename} generado y guardado en /versiones/!"
+                                    st.rerun()
+                                    
+                            except Exception as e:
+                                st.error(f"Error al generar el paquete: {e}")
                 else:
-                    with st.spinner("Empaquetando archivos..."):
-                        try:
-                            transport, sftp = _sftp_connect()
-                            
-                            with sftp.open(f"{revista_base}/PDF/{pdf_filename}", "rb") as f:
-                                pdf_data = f.read()
-                            
-                            with sftp.open(f"{revista_base}/ZIP/{zip_filename}", "rb") as f:
-                                zip_data = f.read()
-                            
-                            package_buffer = BytesIO()
-                            with zipfile.ZipFile(package_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
-                                zf.writestr(pdf_filename, pdf_data)
-                                zf.writestr(zip_filename, zip_data)
-                            
-                            package_filename = f"{aid}_v1_package.zip"
-                            remote_package_path = f"{versions_dir}/{package_filename}"
-                            
-                            _ensure_remote_dir(sftp, versions_dir)
-                            
-                            with sftp.open(remote_package_path, "wb") as f:
-                                f.write(package_buffer.getvalue())
-                            
-                            sftp.close()
-                            transport.close()
-                            
-                            df_ver = read_versions()
-                            new_ver_row = {
-                                "articulo_id": aid,
-                                "fecha": datetime.now().isoformat(timespec="seconds"),
-                                "ruta_pdf": f"versiones/{package_filename}",
-                                "nombre_archivo": package_filename,
-                                "notas": "Version v1 package (PDF + ZIP) generated by editor",
-                            }
-                            df_ver = pd.concat([df_ver, pd.DataFrame([new_ver_row])], ignore_index=True)
-                            save_versions(df_ver)
-                            
-                            append_log("GENERATE_V1", aid, package_filename)
-                            st.success(f"¡Paquete {package_filename} generado y guardado en /versiones/!")
-                            st.rerun()
-                            
-                        except Exception as e:
-                            st.error(f"Error al generar el paquete: {e}")
+                    st.warning("Debe seleccionar una versión para empaquetar.")
+            else:
+                st.info("No hay versiones registradas para este manuscrito.")
 
 # ============================================================
 # TAB 2: REVIEWERS
@@ -987,7 +1123,7 @@ def tab_assignments():
                 df_rev = pd.concat([df_rev, pd.DataFrame([new_row])], ignore_index=True)
                 if save_reviewers(df_rev):
                     append_log("ASSIGN", art_id, f"{r_name} — {version}")
-                    st.success(f"Assignment added: {art_id} → {r_name} ({version}).")
+                    st.success(f"Asignación guardada para {r_name} ({r_email}).")
                     st.rerun()
 
     st.divider()
@@ -1064,6 +1200,72 @@ def tab_assignments():
                     if cancel_btn:
                         st.session_state[f"as_editing_{idx}"] = False
                         st.rerun()
+
+            # --- BOTÓN PARA ENVIAR CORREO MANUAL AL REVISOR (CON ADJUNTO) ---
+            if st.button("📧 Enviar correo al revisor", key=f"email_rev_{idx}", use_container_width=True):
+                st.session_state[f"emailing_{idx}"] = True
+
+            if st.session_state.get(f"emailing_{idx}", False):
+                with st.form(f"email_form_{idx}"):
+                    st.markdown(f"**Enviar correo a:** {row['nombre_revisor']} <{row['email_revisor']}>")
+                    st.markdown(f"**Manuscrito:** {row['articulo_id']} — {row['titulo']}")
+                    asunto = st.text_input("Asunto", value=f"Re: {row['articulo_id']} — {row['titulo']}")
+                    mensaje = st.text_area("Mensaje", height=150, placeholder="Escriba su mensaje aquí...")
+                    
+                    cc1, cc2 = st.columns(2)
+                    with cc1:
+                        if st.form_submit_button("📧 Enviar", use_container_width=True):
+                            if not mensaje.strip():
+                                st.error("El mensaje no puede estar vacío.")
+                            else:
+                                package_bytes = None
+                                package_filename = None
+                                
+                                try:
+                                    transport, sftp = _sftp_connect()
+                                    rs = st.secrets["remote_server"]
+                                    versions_dir = f"{rs['dir'].rstrip('/')}/versiones"
+                                    
+                                    possible_packages = [
+                                        f"{row['articulo_id']}_v{row['version']}_package.zip",
+                                        f"{row['articulo_id']}_{row['version']}_package.zip",
+                                        f"{row['articulo_id']}_v1_package.zip",
+                                        f"{row['articulo_id']}_{row['version']}.zip"
+                                    ]
+                                    
+                                    for pkg in possible_packages:
+                                        try:
+                                            with sftp.open(f"{versions_dir}/{pkg}", "rb") as f:
+                                                package_bytes = f.read()
+                                            package_filename = pkg
+                                            break
+                                        except:
+                                            continue
+                                    
+                                    sftp.close()
+                                    transport.close()
+                                except Exception as e:
+                                    print(f"[WARN] No se pudo leer el paquete: {e}")
+
+                                ok = notify_generic(
+                                    row["email_revisor"],
+                                    row["nombre_revisor"],
+                                    asunto,
+                                    mensaje.strip(),
+                                    attachment_bytes=package_bytes,
+                                    attachment_name=package_filename
+                                )
+                                
+                                if ok:
+                                    st.success(f"Correo enviado a {row['email_revisor']}.")
+                                    st.session_state[f"emailing_{idx}"] = False
+                                    st.rerun()
+                                else:
+                                    st.error("Error al enviar el correo. Revise los logs de Streamlit.")
+                    with cc2:
+                        if st.form_submit_button("❌ Cancelar", use_container_width=True):
+                            st.session_state[f"emailing_{idx}"] = False
+                            st.rerun()
 
             if st.button("🗑️ Delete this assignment", key=f"as_del_{idx}"):
                 df_rev = df_rev.drop(index=idx).reset_index(drop=True)
