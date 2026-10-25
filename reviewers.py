@@ -526,7 +526,6 @@ def download_csv_button(df: pd.DataFrame, filename: str, label: str):
 def tab_articles():
     st.subheader("📚 Manuscripts and books")
 
-    # Mostrar mensaje de éxito si existe en la sesión
     if "success_message" in st.session_state:
         st.success(st.session_state["success_message"])
         del st.session_state["success_message"]
@@ -1080,7 +1079,20 @@ def tab_assignments():
                 with c1:
                     assign_date = st.date_input("Date sent", value=date.today())
                 with c2:
-                    version = st.text_input("Version sent", value="v1")
+                    # --- NUEVO: SELECTBOX CON VERSIONES REALES ---
+                    version_options = []
+                    try:
+                        submission_data = get_submission(art_id)
+                        if submission_data and "versions" in submission_data:
+                            for v in submission_data["versions"]:
+                                v_num = v.get("version", 1)
+                                version_options.append(f"v{v_num}")
+                    except:
+                        pass
+                    if not version_options:
+                        version_options = ["v1"]
+                    
+                    version = st.selectbox("Version sent", version_options)
 
                 notas = st.text_input("Notes (optional)")
 
@@ -1103,7 +1115,7 @@ def tab_assignments():
                 dup = df_rev[
                     (df_rev["articulo_id"] == art_id)
                     & (df_rev["email_revisor"] == r_email)
-                    & (df_rev["version"] == version)
+                    & (df_rev["version"] == version.replace("v", ""))
                 ]
                 if not dup.empty:
                     st.error(f"That assignment already exists ({art_id}, {r_email}, {version}).")
@@ -1117,7 +1129,7 @@ def tab_assignments():
                     "fecha_envio_revision": datetime.combine(
                         assign_date, datetime.min.time()
                     ).isoformat(timespec="seconds"),
-                    "version": version.strip(),
+                    "version": version.replace("v", ""),  # Guardar solo el número
                     "notas": notas.strip(),
                 }
                 df_rev = pd.concat([df_rev, pd.DataFrame([new_row])], ignore_index=True)
@@ -1153,7 +1165,7 @@ def tab_assignments():
                 st.write(f"**Reviewer:** {row['nombre_revisor']}")
                 st.write(f"**Email:** `{row['email_revisor']}`")
                 st.write(f"**Date sent:** {row['fecha_envio_revision'][:10]} ({dias_txt})")
-                st.write(f"**Version sent:** {row['version']}")
+                st.write(f"**Version sent:** v{row['version']}")
                 if row["notas"]:
                     st.write(f"**Notes:** {row['notas']}")
             with c2:
@@ -1172,7 +1184,26 @@ def tab_assignments():
                     e_name = st.text_input("Reviewer name", value=row["nombre_revisor"], key=f"as_n_{idx}")
                     e_email = st.text_input("Reviewer email", value=row["email_revisor"], key=f"as_e_{idx}")
                     e_date = st.date_input("Date sent", value=cur_date, key=f"as_d_{idx}")
-                    e_version = st.text_input("Version", value=row["version"], key=f"as_v_{idx}")
+                    
+                    # --- NUEVO: SELECTBOX CON VERSIONES REALES EN EDICIÓN ---
+                    version_options_edit = []
+                    try:
+                        submission_data_edit = get_submission(row["articulo_id"])
+                        if submission_data_edit and "versions" in submission_data_edit:
+                            for v in submission_data_edit["versions"]:
+                                v_num = v.get("version", 1)
+                                version_options_edit.append(f"v{v_num}")
+                    except:
+                        pass
+                    if not version_options_edit:
+                        version_options_edit = [f"v{row['version']}"]
+                    
+                    try:
+                        cur_version_idx = version_options_edit.index(f"v{row['version']}")
+                    except ValueError:
+                        cur_version_idx = 0
+                    
+                    e_version = st.selectbox("Version", version_options_edit, index=cur_version_idx, key=f"as_v_{idx}")
                     e_notas = st.text_input("Notes", value=row["notas"], key=f"as_no_{idx}")
 
                     cs, cc = st.columns(2)
@@ -1190,7 +1221,7 @@ def tab_assignments():
                             df_rev.loc[idx, "fecha_envio_revision"] = datetime.combine(
                                 e_date, datetime.min.time()
                             ).isoformat(timespec="seconds")
-                            df_rev.loc[idx, "version"] = e_version.strip()
+                            df_rev.loc[idx, "version"] = e_version.replace("v", "").strip()
                             df_rev.loc[idx, "notas"] = e_notas.strip()
                             if save_reviewers(df_rev):
                                 st.session_state[f"as_editing_{idx}"] = False
