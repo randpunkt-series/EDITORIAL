@@ -8,8 +8,12 @@ import json
 import os
 import re
 import time
+import zipfile
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from datetime import date, datetime
-from io import StringIO
+from io import StringIO, BytesIO
 
 import pandas as pd
 import paramiko
@@ -102,6 +106,50 @@ def _cleanup_old_backups(sftp, base_name: str, keep_days: int = 30):
         pass
 
 # ============================================================
+# EMAIL
+# ============================================================
+def _send_email(recipient: str, subject: str, body: str) -> bool:
+    try:
+        cfg = st.secrets.get("email", {})
+        if not cfg.get("smtp_server"):
+            print("[WARN] Configuración SMTP no encontrada en secrets.toml")
+            return False
+
+        msg = MIMEMultipart()
+        msg["From"] = f"{cfg.get('sender_name', 'RandPunkt')} <{cfg['sender_email']}>"
+        msg["To"] = recipient
+        msg["Subject"] = subject
+        msg.attach(MIMEText(body, "plain", "utf-8"))
+
+        server = smtplib.SMTP(cfg["smtp_server"], int(cfg["smtp_port"]))
+        server.starttls()
+        server.login(cfg["sender_email"], cfg["sender_password"])
+        server.send_message(msg)
+        server.quit()
+        return True
+    except Exception as e:
+        print(f"[ERROR] No se pudo enviar correo a {recipient}: {e}")
+        return False
+
+def notify_editor_assignment(editor_login: str, articulo_id: str, titulo: str, editor_email: str):
+    subject = f"[RandPunkt] Nuevo manuscrito asignado: {articulo_id}"
+    body = f"""Estimado/a {editor_login},
+
+Se le ha asignado el siguiente manuscrito para su revisión editorial:
+
+ID: {articulo_id}
+Título: {titulo}
+
+Puede acceder al panel de revisores para descargar los archivos y gestionar la revisión:
+https://randpunkt-revisores.streamlit.app
+
+Saludos cordiales,
+Editor en Jefe
+RandPunkt Journal
+"""
+    return _send_email(editor_email, subject, body)
+
+# ============================================================
 # CSV READ/WRITE
 # ============================================================
 def _read_csv(filename: str, columns: list) -> pd.DataFrame:
@@ -176,6 +224,23 @@ def save_versions(df: pd.DataFrame) -> bool:
 def read_editores() -> pd.DataFrame:
     return _read_csv(st.secrets["csv"]["editores_file"], ["login", "password", "level", "email"])
 
+def get_submission(tracking_id: str) -> dict | None:
+    try:
+        transport, sftp = _sftp_connect()
+        rs = st.secrets["remote_server"]
+        revista_base = rs['revista_dir'].rstrip('/')
+        json_path = f"{revista_base}/METADATA/{tracking_id}.json"
+        
+        with sftp.open(json_path, "r") as f:
+            data = json.loads(f.read().decode("utf-8"))
+        
+        sftp.close()
+        transport.close()
+        return data
+    except Exception as e:
+        print(f"[ERROR] No se pudo leer {tracking_id}.json: {e}")
+        return None
+
 # ============================================================
 # LOG
 # ============================================================
@@ -201,7 +266,7 @@ def append_log(action: str, articulo_id: str, detail: str = ""):
         print(f"[LOG] Could not write to log: {e}")
 
 # ============================================================
-# IMPORT FROM JOURNAL (CON DESCARGA DE ARCHIVOS)
+# IMPORT FROM JOURNAL
 # ============================================================
 def _read_json_remote(sftp, path: str) -> dict | None:
     try:
@@ -218,15 +283,11 @@ def import_from_revista() -> tuple[int, list]:
     try:
         transport, sftp = _sftp_connect()
 
-        # Carpetas de origen en randpunkt.org
         revista_base = rs['revista_dir'].rstrip('/')
         metadata_dir = f"{revista_base}/METADATA"
-        
-        # IMPORTANTE: Carpetas en singular (PDF y ZIP)
         pdf_dir = f"{revista_base}/PDF" 
         zip_dir = f"{revista_base}/ZIP"
         
-        # Carpeta destino en el servidor del panel de revisores
         versions_dir = f"{rs['dir'].rstrip('/')}/versiones"
         _ensure_remote_dir(sftp, versions_dir)
 
@@ -241,18 +302,6 @@ def import_from_revista() -> tuple[int, list]:
         except FileNotFoundError:
             pass
 
-        books = []
-        books_meta_dir = f"{revista_base}/BOOKS/metadata"
-        try:
-            for fname in sorted(sftp.listdir(books_meta_dir)):
-                if not fname.endswith(".json"):
-                    continue
-                data = _read_json_remote(sftp, f"{books_meta_dir}/{fname}")
-                if data:
-                    books.append(data)
-        except FileNotFoundError:
-            pass
-
         df_art = read_articles()
         df_ver = read_versions()
         existing_ids = set(df_art["articulo_id"].tolist()) if not df_art.empty else set()
@@ -260,7 +309,6 @@ def import_from_revista() -> tuple[int, list]:
         new_art_rows = []
         new_ver_rows = []
 
-        # --- PROCESAR ARTÍCULOS ---
         for data in submissions:
             art_id = data.get("tracking_id", "")
             if not art_id:
@@ -288,7 +336,6 @@ def import_from_revista() -> tuple[int, list]:
             remote_pdf_src = f"{pdf_dir}/{pdf_filename}" if pdf_filename else ""
             remote_zip_src = f"{zip_dir}/{zip_filename}" if zip_filename else ""
             
-            # COPIAR EL PDF Y ZIP
             if remote_pdf_src:
                 try:
                     sftp.stat(remote_pdf_src)
@@ -333,51 +380,6 @@ def import_from_revista() -> tuple[int, list]:
                     "notas": "Initial submission (imported)",
                 })
 
-        # --- PROCESAR LIBROS ---
-        for data in books:
-            book_id = data.get("id", "")
-            if not book_id or book_id in existing_ids:
-                continue
-            
-            raw_pdf_name = data.get("pdf", "")
-            pdf_filename = os.path.basename(raw_pdf_name) if raw_pdf_name else ""
-            
-            remote_pdf_src = f"{revista_base}/BOOKS/pdfs/{pdf_filename}" if pdf_filename else ""
-
-            if remote_pdf_src:
-                try:
-                    sftp.stat(remote_pdf_src)
-                    dest_pdf = f"{versions_dir}/{pdf_filename}"
-                    sftp.get(remote_pdf_src, dest_pdf)
-                except Exception as e:
-                    print(f"Error copiando libro PDF {pdf_filename}: {e}")
-
-            new_art_rows.append({
-                "articulo_id": book_id,
-                "tipo": "libro",
-                "titulo": data.get("title", ""),
-                "ruta_pdf": f"versiones/{pdf_filename}" if pdf_filename else "",
-                "ruta_cover": "",
-                "fecha_creacion": data.get("created_at", ""),
-                "estado": "en_revision",
-                "isbn": data.get("isbn", ""),
-                "motivo_retiro": "",
-                "fecha_retiro": "",
-                "idioma_original": data.get("original_language", ""),
-                "formato_original": data.get("original_format", ""),
-                "editor_asignado": "",
-            })
-
-            if pdf_filename:
-                new_ver_rows.append({
-                    "articulo_id": book_id,
-                    "fecha": data.get("created_at", ""),
-                    "ruta_pdf": f"versiones/{pdf_filename}",
-                    "nombre_archivo": pdf_filename,
-                    "notas": "Initial book file (imported)",
-                })
-
-        # Guardar cambios
         if new_art_rows:
             df_new_art = pd.DataFrame(new_art_rows)
             df_art = pd.concat([df_art, df_new_art], ignore_index=True)
@@ -495,7 +497,6 @@ def tab_articles():
     user_login = st.session_state.get('editor_login', '')
     editor_email_actual = st.session_state.get('editor_email', '').strip().lower()
 
-    # Import button (only for Level 0)
     if user_level == 0:
         col1, col2 = st.columns([3, 1])
         with col1:
@@ -513,7 +514,6 @@ def tab_articles():
                 else:
                     st.info("No new manuscripts or books to import.")
 
-    # Filter by level
     df_art_all = read_articles()
     if df_art_all.empty:
         st.info("No manuscripts or books registered yet.")
@@ -525,7 +525,6 @@ def tab_articles():
             st.info("You have no manuscripts assigned to you.")
             return
 
-    # Add book manually (only Level 0)
     if user_level == 0:
         with st.expander("➕ Add book manually", expanded=False):
             with st.form("add_book_form"):
@@ -571,7 +570,6 @@ def tab_articles():
                             st.success(f"Book {new_id} added.")
                             st.rerun()
 
-    # Filter active/retired
     filtro = st.radio(
         "Filter",
         ["Active", "Retired", "All"],
@@ -617,7 +615,6 @@ def tab_articles():
                 if row["fecha_retiro"]:
                     st.write(f"**Retirement date:** {row['fecha_retiro']}")
 
-                # Assignment (only for Level 0)
                 if user_level == 0:
                     st.markdown("---")
                     st.markdown("**Assign editor**")
@@ -642,9 +639,25 @@ def tab_articles():
                         new_val = "" if selected_editor == "— Unassigned —" else selected_editor
                         df_full = read_articles()
                         df_full.loc[df_full["articulo_id"] == aid, "editor_asignado"] = new_val
+                        
                         if save_articles(df_full):
                             append_log("ASSIGN-EDITOR", aid, f"Assigned to {new_val or 'none'}")
-                            st.success("Assignment updated.")
+                            
+                            # --- ENVÍO DE CORREO AL EDITOR ---
+                            if new_val:
+                                df_ed = read_editores()
+                                match = df_ed[df_ed["login"] == new_val]
+                                if not match.empty:
+                                    editor_email = match.iloc[0]["email"]
+                                    ok = notify_editor_assignment(new_val, aid, row["titulo"], editor_email)
+                                    if ok:
+                                        st.success(f"Asignación guardada y correo enviado a {new_val} ({editor_email}).")
+                                    else:
+                                        st.warning(f"Asignación guardada, pero falló el envío del correo a {new_val}.")
+                                else:
+                                    st.warning(f"Asignación guardada, pero no se encontró el correo de {new_val} en registro_editores.csv.")
+                            else:
+                                st.success("Assignment updated.")
                             st.rerun()
 
             with c2:
@@ -720,46 +733,104 @@ def tab_articles():
                             st.success("Restored.")
                             st.rerun()
 
-            st.markdown("**Version history**")
-            df_ver = list_versions_for(aid)
-            if df_ver.empty:
-                st.info("No versions uploaded yet.")
-            else:
-                # --- NUEVA LÓGICA DE DESCARGA ---
-                for _, v_row in df_ver.iterrows():
-                    filename = v_row["nombre_archivo"]
-                    # Ruta completa en el servidor del panel de revisores
-                    remote_path = f"{st.secrets['remote_server']['dir'].rstrip('/')}/versiones/{filename}"
-                    
-                    st.write(f"📄 **{filename}** ({v_row['fecha'][:10]})")
-                    st.write(f"Notas: {v_row['notas']}")
-                    
-                    # Intentar descargar el archivo vía SFTP
+            st.markdown("**Version history & Downloads**")
+            
+            rs = st.secrets["remote_server"]
+            revista_base = rs['revista_dir'].rstrip('/')
+            versions_dir = f"{rs['dir'].rstrip('/')}/versiones"
+            
+            submission_data = get_submission(aid)
+            if submission_data and "versions" in submission_data and len(submission_data["versions"]) > 0:
+                pdf_filename = submission_data["versions"][0].get("pdf", "")
+                zip_filename = submission_data["versions"][0].get("supplementary_zip", "")
+                
+                col_dl1, col_dl2 = st.columns(2)
+                
+                if pdf_filename:
                     try:
                         transport, sftp = _sftp_connect()
-                        with sftp.open(remote_path, "rb") as f:
-                            file_bytes = f.read()
+                        with sftp.open(f"{revista_base}/PDF/{pdf_filename}", "rb") as f:
+                            pdf_bytes = f.read()
                         sftp.close()
                         transport.close()
-                        
-                        # Determinar MIME type según la extensión
-                        if filename.endswith(".zip"):
-                            mime = "application/zip"
-                        elif filename.endswith(".pdf"):
-                            mime = "application/pdf"
-                        else:
-                            mime = "application/octet-stream"
-
-                        st.download_button(
-                            label=f"⬇️ Download {filename}",
-                            data=file_bytes,
-                            file_name=filename,
-                            mime=mime,
-                            key=f"dl_{aid}_{filename}"
+                        col_dl1.download_button(
+                            label=f"⬇️ Download PDF Original",
+                            data=pdf_bytes,
+                            file_name=pdf_filename,
+                            mime="application/pdf",
+                            key=f"dl_pdf_{aid}"
                         )
                     except Exception as e:
-                        st.error(f"No se pudo cargar el archivo: {e}")
-                # ---------------------------------
+                        col_dl1.error(f"PDF no disponible.")
+                
+                if zip_filename:
+                    try:
+                        transport, sftp = _sftp_connect()
+                        with sftp.open(f"{revista_base}/ZIP/{zip_filename}", "rb") as f:
+                            zip_bytes = f.read()
+                        sftp.close()
+                        transport.close()
+                        col_dl2.download_button(
+                            label=f"⬇️ Download ZIP Original",
+                            data=zip_bytes,
+                            file_name=zip_filename,
+                            mime="application/zip",
+                            key=f"dl_zip_{aid}"
+                        )
+                    except Exception as e:
+                        col_dl2.error(f"ZIP no disponible.")
+
+            st.divider()
+            st.markdown("**Generate Edition Package**")
+            st.caption("Creates a ZIP file in /versiones/ containing both the PDF and the supplementary ZIP.")
+            
+            if st.button(f"📦 Generar Paquete v1 para {aid}", key=f"gen_v1_{aid}", use_container_width=True):
+                if not pdf_filename or not zip_filename:
+                    st.error("No se encontraron los archivos originales para empaquetar.")
+                else:
+                    with st.spinner("Empaquetando archivos..."):
+                        try:
+                            transport, sftp = _sftp_connect()
+                            
+                            with sftp.open(f"{revista_base}/PDF/{pdf_filename}", "rb") as f:
+                                pdf_data = f.read()
+                            
+                            with sftp.open(f"{revista_base}/ZIP/{zip_filename}", "rb") as f:
+                                zip_data = f.read()
+                            
+                            package_buffer = BytesIO()
+                            with zipfile.ZipFile(package_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+                                zf.writestr(pdf_filename, pdf_data)
+                                zf.writestr(zip_filename, zip_data)
+                            
+                            package_filename = f"{aid}_v1_package.zip"
+                            remote_package_path = f"{versions_dir}/{package_filename}"
+                            
+                            _ensure_remote_dir(sftp, versions_dir)
+                            
+                            with sftp.open(remote_package_path, "wb") as f:
+                                f.write(package_buffer.getvalue())
+                            
+                            sftp.close()
+                            transport.close()
+                            
+                            df_ver = read_versions()
+                            new_ver_row = {
+                                "articulo_id": aid,
+                                "fecha": datetime.now().isoformat(timespec="seconds"),
+                                "ruta_pdf": f"versiones/{package_filename}",
+                                "nombre_archivo": package_filename,
+                                "notas": "Version v1 package (PDF + ZIP) generated by editor",
+                            }
+                            df_ver = pd.concat([df_ver, pd.DataFrame([new_ver_row])], ignore_index=True)
+                            save_versions(df_ver)
+                            
+                            append_log("GENERATE_V1", aid, package_filename)
+                            st.success(f"¡Paquete {package_filename} generado y guardado en /versiones/!")
+                            st.rerun()
+                            
+                        except Exception as e:
+                            st.error(f"Error al generar el paquete: {e}")
 
 # ============================================================
 # TAB 2: REVIEWERS
