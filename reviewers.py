@@ -1,7 +1,7 @@
 """
 RandPunkt Journal — Editorial panel: reviewers and versions management.
-Incluye sistema de roles (Level 0 = Jefe, Level 1 = Asociado), filtro de correos
-y publicación final en Zenodo exclusiva para el Editor en Jefe.
+Includes role system (Level 0 = Chief, Level 1 = Associate), email filtering
+and final publication in Zenodo exclusive to the Chief Editor.
 """
 
 import io
@@ -50,7 +50,7 @@ COLS_VERSIONES = [
     "articulo_id", "fecha", "ruta_pdf", "nombre_archivo", "notas",
 ]
 
-# Añadimos los nuevos estados al flujo
+# Add new states to the workflow
 ESTADOS_ACTIVOS = [
     "en_revision", 
     "aprobado_por_asociado", 
@@ -58,16 +58,16 @@ ESTADOS_ACTIVOS = [
     "aprobado_final",
     "aceptado", 
     "todos_aprobados", 
-    "publicado"
+    "published"
 ]
 ESTADOS_RETIRADOS = ["retirado"]
 MOTIVOS_RETIRO = [
-    "rechazado_por_revisores",
-    "retirado_por_autor",
-    "no_respuesta_autor",
-    "duplicado",
-    "fuera_de_alcance",
-    "otro",
+    "rejected_by_reviewers",
+    "withdrawn_by_author",
+    "author_unresponsive",
+    "duplicate",
+    "out_of_scope",
+    "other",
 ]
 
 # ============================================================
@@ -125,7 +125,7 @@ def _send_email(recipient: str, subject: str, body: str, attachment_bytes: bytes
     try:
         cfg = st.secrets.get("email", {})
         if not cfg.get("smtp_server"):
-            print("[WARN] Configuración SMTP no encontrada en secrets.toml")
+            print("[WARN] SMTP configuration not found in secrets.toml")
             return False
 
         msg = MIMEMultipart()
@@ -148,16 +148,16 @@ def _send_email(recipient: str, subject: str, body: str, attachment_bytes: bytes
         server.quit()
         return True
     except Exception as e:
-        print(f"[ERROR] No se pudo enviar correo a {recipient}: {e}")
+        print(f"[ERROR] Could not send email to {recipient}: {e}")
         return False
 
 def notify_generic(recipient_email: str, recipient_name: str, subject: str, mensaje: str, attachment_bytes: bytes = None, attachment_name: str = None):
-    body = f"""Estimado/a {recipient_name},
+    body = f"""Dear {recipient_name},
 
 {mensaje}
 
-Saludos cordiales,
-Comité Editorial
+Best regards,
+Editorial Committee
 RandPunkt Journal
 """
     return _send_email(recipient_email, subject, body, attachment_bytes, attachment_name)
@@ -166,9 +166,8 @@ RandPunkt Journal
 # ZENODO INTEGRATION
 # ============================================================
 def _get_zenodo_config():
-    """Lee las credenciales de Zenodo desde los secrets de Streamlit."""
+    """Read Zenodo credentials from Streamlit secrets."""
     zen = st.secrets.get("zenodo", {})
-    # Si no está configurado el sandbox, asume producción
     if zen.get("sandbox", False):
         return zen.get("sandbox_api", "https://sandbox.zenodo.org/api"), zen.get("sandbox_token", "")
     return zen.get("api", "https://zenodo.org/api"), zen.get("token", "")
@@ -191,7 +190,7 @@ def _zenodo_request(method: str, url: str, *, headers=None, json_data=None, data
     raise last_exc
 
 def build_zenodo_metadata(submission: dict) -> dict:
-    """Construye el JSON de metadatos requerido por Zenodo."""
+    """Build the JSON metadata required by Zenodo."""
     authors = []
     ca = submission.get("corresponding_author", {})
     authors.append({
@@ -249,15 +248,14 @@ def build_zenodo_metadata(submission: dict) -> dict:
     }
 
 def publish_to_zenodo(articulo_id: str, submission_data: dict, pdf_path: str, pdf_bytes: bytes) -> tuple[bool, str]:
-    """Sube el PDF a Zenodo y publica el depósito. Devuelve (ok, mensaje)."""
+    """Upload the PDF to Zenodo and publish the deposition. Returns (ok, message)."""
     try:
         api_url, token = _get_zenodo_config()
         if not token:
-            return False, "El token de Zenodo no está configurado en secrets.toml"
+            return False, "Zenodo token is not configured in secrets.toml"
 
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
         
-        # 1. Crear depósito
         metadata = build_zenodo_metadata(submission_data)
         payload = {"metadata": metadata}
         r = _zenodo_request("POST", f"{api_url}/deposit/depositions", headers=headers, json_data=payload)
@@ -265,21 +263,19 @@ def publish_to_zenodo(articulo_id: str, submission_data: dict, pdf_path: str, pd
         dep_id = dep["id"]
         bucket_url = dep["links"]["bucket"]
 
-        # 2. Subir archivo
         filename = f"{articulo_id}.pdf"
         file_headers = {"Authorization": f"Bearer {token}"}
         _zenodo_request("PUT", f"{bucket_url}/{filename}", headers=file_headers, data=pdf_bytes, timeout=300)
 
-        # 3. Publicar
         r = _zenodo_request("POST", f"{api_url}/deposit/depositions/{dep_id}/actions/publish", headers=headers)
         published = r.json()
 
         doi = published.get("doi", "")
         record_url = published.get("links", {}).get("record_html", "")
         
-        return True, f"Publicado con éxito. DOI: {doi}"
+        return True, f"Published successfully. DOI: {doi}"
     except Exception as e:
-        return False, f"Error al publicar en Zenodo: {e}"
+        return False, f"Error publishing to Zenodo: {e}"
 
 # ============================================================
 # CSV READ/WRITE
@@ -370,7 +366,7 @@ def get_submission(tracking_id: str) -> dict | None:
         transport.close()
         return data
     except Exception as e:
-        print(f"[ERROR] No se pudo leer {tracking_id}.json: {e}")
+        print(f"[ERROR] Could not read {tracking_id}.json: {e}")
         return None
 
 # ============================================================
@@ -474,7 +470,7 @@ def import_from_revista() -> tuple[int, list]:
                     dest_pdf = f"{versions_dir}/{pdf_filename}"
                     sftp.get(remote_pdf_src, dest_pdf)
                 except Exception as e:
-                    print(f"Error copiando PDF {pdf_filename}: {e}")
+                    print(f"Error copying PDF {pdf_filename}: {e}")
                     errors.append(f"Could not copy PDF for {art_id}")
 
             if remote_zip_src:
@@ -483,7 +479,7 @@ def import_from_revista() -> tuple[int, list]:
                     dest_zip = f"{versions_dir}/{zip_filename}"
                     sftp.get(remote_zip_src, dest_zip)
                 except Exception as e:
-                    print(f"Error copiando ZIP {zip_filename}: {e}")
+                    print(f"Error copying ZIP {zip_filename}: {e}")
                     errors.append(f"Could not copy ZIP for {art_id}")
 
             if is_new:
@@ -544,7 +540,7 @@ def upload_version(articulo_id: str, pdf_bytes: bytes, zip_bytes: bytes, pdf_nam
         
         submission_data = get_submission(articulo_id)
         if not submission_data:
-            return False, "No se encontró el JSON de metadatos."
+            return False, "Metadata JSON not found."
         
         current_version = submission_data.get("current_version", 1)
         next_version = current_version + 1
@@ -787,10 +783,10 @@ def tab_articles():
                     if submission_data:
                         author = submission_data.get("corresponding_author", {})
                         st.markdown("---")
-                        st.markdown("**Contacto del Autor (Solo para el Editor)**")
-                        st.write(f"**Nombre:** {author.get('name', '—')}")
+                        st.markdown("**Author Contact (Editor Only)**")
+                        st.write(f"**Name:** {author.get('name', '—')}")
                         st.write(f"**Email:** `{author.get('email', '—')}`")
-                        st.write(f"**Afiliación:** {author.get('affiliation', '—')}")
+                        st.write(f"**Affiliation:** {author.get('affiliation', '—')}")
 
                 if user_level == 0:
                     st.markdown("---")
@@ -806,7 +802,7 @@ def tab_articles():
                         current_idx = 0
 
                     selected_editor = st.selectbox(
-                        "Editor Asociado (Level 1)",
+                        "Associate Editor (Level 1)",
                         options,
                         index=current_idx,
                         key=f"assign_{aid}"
@@ -825,66 +821,62 @@ def tab_articles():
             with c2:
                 st.write("**Actions**")
 
-                # ========================================================
-                # BLOQUE: DECISIONES EDITORIALES Y PUBLICACIÓN
-                # ========================================================
                 st.markdown("---")
-                st.markdown("**Decisiones Editoriales**")
+                st.markdown("**Editorial Decisions**")
                 
                 estado_actual = row["estado"]
 
-                if user_level == 1: # EDITOR ASOCIADO
+                if user_level == 1:
                     if estado_actual == "en_revision":
-                        if st.button("✅ Aprobar Revisión (Enviar a Jefe)", key=f"app_asoc_{aid}", use_container_width=True, type="primary"):
+                        if st.button("✅ Approve Review (Send to Chief)", key=f"app_asoc_{aid}", use_container_width=True, type="primary"):
                             df_full = read_articles()
                             df_full.loc[df_full["articulo_id"] == aid, "estado"] = "aprobado_por_asociado"
                             if save_articles(df_full):
                                 append_log("APPROVE-ASSOC", aid, "Approved by associate, sent to chief editor")
-                                st.success("Aprobado por asociado. El Editor en Jefe ha sido notificado.")
+                                st.success("Approved by associate. The Chief Editor has been notified.")
                                 st.rerun()
                                 
                     elif estado_actual == "listo_para_coautores":
-                        if st.button("✅ Dar Visto Bueno Final", key=f"app_final_{aid}", use_container_width=True, type="primary"):
+                        if st.button("✅ Give Final Approval", key=f"app_final_{aid}", use_container_width=True, type="primary"):
                             df_full = read_articles()
                             df_full.loc[df_full["articulo_id"] == aid, "estado"] = "todos_aprobados"
                             if save_articles(df_full):
                                 append_log("APPROVE-FINAL", aid, "Final approval by associate, ready for coauthors")
-                                st.success("Aprobación final registrada. Listo para el panel de coautores.")
+                                st.success("Final approval recorded. Ready for the coauthors panel.")
                                 st.rerun()
 
-                elif user_level == 0: # EDITOR EN JEFE
+                elif user_level == 0:
                     if estado_actual == "aprobado_por_asociado":
-                        st.info("Aprobado por el asociado. Realiza la edición, traducción y proofreading.")
-                        if st.button("📝 Confirmar Edición (Devolver al Asociado)", key=f"edit_chief_{aid}", use_container_width=True, type="primary"):
+                        st.info("Approved by the associate. Perform editing, translation and proofreading.")
+                        if st.button("📝 Confirm Editing (Return to Associate)", key=f"edit_chief_{aid}", use_container_width=True, type="primary"):
                             df_full = read_articles()
                             df_full.loc[df_full["articulo_id"] == aid, "estado"] = "listo_para_coautores"
                             if save_articles(df_full):
-                                append_log("EDIT-CHIEF", aid, "Edition complete, returned to associate")
-                                st.success("Edición confirmada. El artículo ha vuelto al editor asociado.")
+                                append_log("EDIT-CHIEF", aid, "Editing complete, returned to associate")
+                                st.success("Editing confirmed. The item has been returned to the associate editor.")
                                 st.rerun()
 
                     elif estado_actual == "aprobado_final":
-                        if st.button("🚀 Dar Aprobado Final (Enviar a Coautores)", key=f"app_final_chief_{aid}", use_container_width=True, type="primary"):
+                        if st.button("🚀 Give Final Approval (Send to Coauthors)", key=f"app_final_chief_{aid}", use_container_width=True, type="primary"):
                             df_full = read_articles()
                             df_full.loc[df_full["articulo_id"] == aid, "estado"] = "todos_aprobados"
                             if save_articles(df_full):
                                 append_log("APPROVE-FINAL-CHIEF", aid, "Final approval by chief, ready for coauthors")
-                                st.success("Aprobado final. El artículo ya aparece en el panel de coautores.")
+                                st.success("Final approval given. The item now appears in the coauthors panel.")
                                 st.rerun()
 
                     elif estado_actual == "todos_aprobados":
-                        st.success("🎉 Todos los coautores han aprobado este manuscrito.")
+                        st.success("🎉 All coauthors have approved this manuscript.")
                         
-                        if st.button("🚀 PUBLICAR EN ZENODO", key=f"publish_zen_{aid}", use_container_width=True, type="primary"):
-                            with st.spinner("Subiendo a Zenodo..."):
-                                # 1. Descargar el PDF más reciente
+                        if st.button("🚀 PUBLISH TO ZENODO", key=f"publish_zen_{aid}", use_container_width=True, type="primary"):
+                            with st.spinner("Uploading to Zenodo..."):
                                 submission_data = get_submission(aid)
                                 if not submission_data:
-                                    st.error("No se encontró el JSON de metadatos.")
+                                    st.error("Metadata JSON not found.")
                                 else:
                                     versions = submission_data.get("versions", [])
                                     if not versions:
-                                        st.error("No hay versiones del PDF registradas.")
+                                        st.error("No PDF versions registered.")
                                     else:
                                         latest_pdf = versions[-1]["pdf"]
                                         rs = st.secrets["remote_server"]
@@ -899,12 +891,11 @@ def tab_articles():
                                             transport.close()
                                         except Exception as e:
                                             pdf_bytes = None
-                                            st.error(f"No se pudo leer el PDF: {e}")
+                                            st.error(f"Could not read the PDF: {e}")
 
                                         if pdf_bytes:
                                             ok, msg = publish_to_zenodo(aid, submission_data, pdf_path, pdf_bytes)
                                             if ok:
-                                                # 2. Actualizar el JSON
                                                 submission_data["status"] = "published"
                                                 submission_data["zenodo"] = {"doi": msg.split("DOI: ")[-1], "url": ""}
                                                 try:
@@ -915,20 +906,18 @@ def tab_articles():
                                                     sftp.close()
                                                     transport.close()
                                                 except Exception as e:
-                                                    st.warning(f"Publicado, pero no se pudo actualizar el JSON: {e}")
+                                                    st.warning(f"Published, but could not update the JSON: {e}")
 
-                                                # 3. Actualizar el CSV
                                                 df_full = read_articles()
-                                                df_full.loc[df_full["articulo_id"] == aid, "estado"] = "publicado"
+                                                df_full.loc[df_full["articulo_id"] == aid, "estado"] = "published"
                                                 save_articles(df_full)
                                                 
                                                 append_log("PUBLISH-ZENODO", aid, msg)
                                                 st.balloons()
-                                                st.success(f"¡Publicación exitosa! {msg}")
+                                                st.success(f"Publication successful! {msg}")
                                                 st.rerun()
                                             else:
                                                 st.error(msg)
-                # ========================================================
 
                 with st.form(f"upload_version_{aid}_{idx}"):
                     st.markdown("**Upload new version (PDF + ZIP)**")
@@ -949,7 +938,7 @@ def tab_articles():
                     )
                     if st.form_submit_button("⬆️ Upload Version", use_container_width=True):
                         if pdf_file is None or zip_file is None:
-                            st.error("Debe seleccionar tanto el PDF como el ZIP.")
+                            st.error("You must select both the PDF and the ZIP.")
                         else:
                             ok, result = upload_version(
                                 aid,
@@ -960,7 +949,7 @@ def tab_articles():
                                 notas.strip()
                             )
                             if ok:
-                                st.success(f"Versión {result} subida correctamente.")
+                                st.success(f"Version {result} uploaded successfully.")
                                 st.rerun()
                             else:
                                 st.error(f"Error: {result}")
@@ -1011,9 +1000,8 @@ def tab_articles():
                             st.success("Restored.")
                             st.rerun()
 
-            # --- BOTÓN PARA ENVIAR CORREO AL EDITOR ASOCIADO (Jefe) ---
             if user_level == 0 and row["editor_asignado"]:
-                if st.button(f"📧 Enviar correo a {row['editor_asignado']}", key=f"email_editor_{aid}", use_container_width=True):
+                if st.button(f"📧 Send email to {row['editor_asignado']}", key=f"email_editor_{aid}", use_container_width=True):
                     st.session_state[f"emailing_editor_{aid}"] = True
 
                 if st.session_state.get(f"emailing_editor_{aid}", False):
@@ -1022,27 +1010,27 @@ def tab_articles():
                         match = df_ed[df_ed["login"] == row["editor_asignado"]]
                         editor_email = match.iloc[0]["email"] if not match.empty else ""
                         
-                        st.markdown(f"**Enviar correo a:** {row['editor_asignado']} <{editor_email}>")
-                        asunto = st.text_input("Asunto", value=f"Asignación: {aid} — {row['titulo']}")
-                        mensaje = st.text_area("Mensaje", height=150, placeholder="Escriba su mensaje aquí...")
+                        st.markdown(f"**Send email to:** {row['editor_asignado']} <{editor_email}>")
+                        asunto = st.text_input("Subject", value=f"Assignment: {aid} — {row['titulo']}")
+                        mensaje = st.text_area("Message", height=150, placeholder="Type your message here...")
                         
                         cc1, cc2 = st.columns(2)
                         with cc1:
-                            if st.form_submit_button("📧 Enviar", use_container_width=True):
+                            if st.form_submit_button("📧 Send", use_container_width=True):
                                 if not mensaje.strip():
-                                    st.error("El mensaje no puede estar vacío.")
+                                    st.error("The message cannot be empty.")
                                 elif not editor_email:
-                                    st.error("No se encontró el correo del editor.")
+                                    st.error("Editor email not found.")
                                 else:
                                     ok = notify_generic(editor_email, row["editor_asignado"], asunto, mensaje.strip())
                                     if ok:
-                                        st.success(f"Correo enviado a {editor_email}.")
+                                        st.success(f"Email sent to {editor_email}.")
                                         st.session_state[f"emailing_editor_{aid}"] = False
                                         st.rerun()
                                     else:
-                                        st.error("Error al enviar el correo.")
+                                        st.error("Error sending email.")
                         with cc2:
-                            if st.form_submit_button("❌ Cancelar", use_container_width=True):
+                            if st.form_submit_button("❌ Cancel", use_container_width=True):
                                 st.session_state[f"emailing_editor_{aid}"] = False
                                 st.rerun()
 
@@ -1056,7 +1044,7 @@ def tab_articles():
             if submission_data and "versions" in submission_data and len(submission_data["versions"]) > 0:
                 versions_list = submission_data["versions"]
                 
-                st.markdown("Seleccione la versión que desea empaquetar:")
+                st.markdown("Select the version you want to package:")
                 
                 selected_pdf = None
                 selected_zip = None
@@ -1069,14 +1057,14 @@ def tab_articles():
                     v_date = ver.get("submitted_at", "")[:10]
                     v_notes = ver.get("notes", "")
                     
-                    st.markdown(f"**Versión v{v_num}** ({v_date}) - {v_notes}")
+                    st.markdown(f"**Version v{v_num}** ({v_date}) - {v_notes}")
                     
                     col_pdf, col_zip = st.columns(2)
                     
                     if v_pdf:
                         with col_pdf:
-                            if st.button(f"⬇️ Descargar PDF v{v_num}", key=f"btn_pdf_{aid}_{v_num}"):
-                                with st.spinner(f"Cargando PDF v{v_num}..."):
+                            if st.button(f"⬇️ Download PDF v{v_num}", key=f"btn_pdf_{aid}_{v_num}"):
+                                with st.spinner(f"Loading PDF v{v_num}..."):
                                     try:
                                         transport, sftp = _sftp_connect()
                                         for path in [f"{revista_base}/PDF/{v_pdf}", f"{versions_dir}/{v_pdf}"]:
@@ -1084,7 +1072,7 @@ def tab_articles():
                                                 with sftp.open(path, "rb") as f:
                                                     pdf_bytes = f.read()
                                                 st.download_button(
-                                                    label=f"Guardar PDF v{v_num}",
+                                                    label=f"Save PDF v{v_num}",
                                                     data=pdf_bytes,
                                                     file_name=v_pdf,
                                                     mime="application/pdf",
@@ -1096,12 +1084,12 @@ def tab_articles():
                                         sftp.close()
                                         transport.close()
                                     except Exception as e:
-                                        st.error(f"Error al cargar PDF: {e}")
+                                        st.error(f"Error loading PDF: {e}")
                     
                     if v_zip:
                         with col_zip:
-                            if st.button(f"⬇️ Descargar ZIP v{v_num}", key=f"btn_zip_{aid}_{v_num}"):
-                                with st.spinner(f"Cargando ZIP v{v_num}..."):
+                            if st.button(f"⬇️ Download ZIP v{v_num}", key=f"btn_zip_{aid}_{v_num}"):
+                                with st.spinner(f"Loading ZIP v{v_num}..."):
                                     try:
                                         transport, sftp = _sftp_connect()
                                         for path in [f"{revista_base}/ZIP/{v_zip}", f"{versions_dir}/{v_zip}"]:
@@ -1109,7 +1097,7 @@ def tab_articles():
                                                 with sftp.open(path, "rb") as f:
                                                     zip_bytes = f.read()
                                                 st.download_button(
-                                                    label=f"Guardar ZIP v{v_num}",
+                                                    label=f"Save ZIP v{v_num}",
                                                     data=zip_bytes,
                                                     file_name=v_zip,
                                                     mime="application/zip",
@@ -1121,28 +1109,28 @@ def tab_articles():
                                         sftp.close()
                                         transport.close()
                                     except Exception as e:
-                                        st.error(f"Error al cargar ZIP: {e}")
+                                        st.error(f"Error loading ZIP: {e}")
                     
                     if st.radio(
-                        f"Seleccionar v{v_num} para empaquetar",
-                        options=["No", "Sí"],
+                        f"Select v{v_num} for packaging",
+                        options=["No", "Yes"],
                         index=0,
                         key=f"select_v{v_num}_{aid}",
                         horizontal=True
-                    ) == "Sí":
+                    ) == "Yes":
                         selected_pdf = v_pdf
                         selected_zip = v_zip
                         selected_version_num = v_num
 
                 st.divider()
                 st.markdown("**Generate Edition Package**")
-                st.caption("Crea un ZIP en /versiones/ con el PDF y el ZIP de la versión seleccionada.")
+                st.caption("Creates a ZIP in /versiones/ with the PDF and ZIP of the selected version.")
                 
                 if selected_pdf and selected_zip:
-                    st.info(f"Versión seleccionada: v{selected_version_num}")
+                    st.info(f"Selected version: v{selected_version_num}")
                     
-                    if st.button(f"📦 Generar Paquete v{selected_version_num} para {aid}", key=f"gen_pkg_{aid}", use_container_width=True):
-                        with st.spinner("Empaquetando archivos..."):
+                    if st.button(f"📦 Generate Package v{selected_version_num} for {aid}", key=f"gen_pkg_{aid}", use_container_width=True):
+                        with st.spinner("Packaging files..."):
                             try:
                                 transport, sftp = _sftp_connect()
                                 
@@ -1165,7 +1153,7 @@ def tab_articles():
                                         continue
                                 
                                 if not pdf_data or not zip_data:
-                                    st.error("No se pudieron leer los archivos de la versión seleccionada.")
+                                    st.error("Could not read the files of the selected version.")
                                 else:
                                     package_buffer = BytesIO()
                                     with zipfile.ZipFile(package_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
@@ -1192,15 +1180,15 @@ def tab_articles():
                                     save_versions(df_ver)
                                     
                                     append_log("GENERATE_PACKAGE", aid, package_filename)
-                                    st.session_state["success_message"] = f"¡Paquete {package_filename} generado y guardado en /versiones/!"
+                                    st.session_state["success_message"] = f"Package {package_filename} generated and saved to /versiones/!"
                                     st.rerun()
                                     
                             except Exception as e:
-                                st.error(f"Error al generar el paquete: {e}")
+                                st.error(f"Error generating package: {e}")
                 else:
-                    st.warning("Debe seleccionar una versión para empaquetar.")
+                    st.warning("You must select a version to package.")
             else:
-                st.info("No hay versiones registradas para este manuscrito.")
+                st.info("No versions registered for this manuscript.")
 
 # ============================================================
 # TAB 2: REVIEWERS
@@ -1314,7 +1302,6 @@ def tab_assignments():
                 with c1:
                     assign_date = st.date_input("Date sent", value=date.today())
                 with c2:
-                    # --- NUEVO: SELECTBOX CON VERSIONES REALES ---
                     version_options = []
                     try:
                         submission_data = get_submission(art_id)
@@ -1364,13 +1351,13 @@ def tab_assignments():
                     "fecha_envio_revision": datetime.combine(
                         assign_date, datetime.min.time()
                     ).isoformat(timespec="seconds"),
-                    "version": version.replace("v", ""),  # Guardar solo el número
+                    "version": version.replace("v", ""),
                     "notas": notas.strip(),
                 }
                 df_rev = pd.concat([df_rev, pd.DataFrame([new_row])], ignore_index=True)
                 if save_reviewers(df_rev):
                     append_log("ASSIGN", art_id, f"{r_name} — {version}")
-                    st.success(f"Asignación guardada para {r_name} ({r_email}).")
+                    st.success(f"Assignment saved for {r_name} ({r_email}).")
                     st.rerun()
 
     st.divider()
@@ -1420,7 +1407,6 @@ def tab_assignments():
                     e_email = st.text_input("Reviewer email", value=row["email_revisor"], key=f"as_e_{idx}")
                     e_date = st.date_input("Date sent", value=cur_date, key=f"as_d_{idx}")
                     
-                    # --- NUEVO: SELECTBOX CON VERSIONES REALES EN EDICIÓN ---
                     version_options_edit = []
                     try:
                         submission_data_edit = get_submission(row["articulo_id"])
@@ -1467,22 +1453,21 @@ def tab_assignments():
                         st.session_state[f"as_editing_{idx}"] = False
                         st.rerun()
 
-            # --- BOTÓN PARA ENVIAR CORREO MANUAL AL REVISOR (CON ADJUNTO) ---
-            if st.button("📧 Enviar correo al revisor", key=f"email_rev_{idx}", use_container_width=True):
+            if st.button("📧 Send email to reviewer", key=f"email_rev_{idx}", use_container_width=True):
                 st.session_state[f"emailing_{idx}"] = True
 
             if st.session_state.get(f"emailing_{idx}", False):
                 with st.form(f"email_form_{idx}"):
-                    st.markdown(f"**Enviar correo a:** {row['nombre_revisor']} <{row['email_revisor']}>")
-                    st.markdown(f"**Manuscrito:** {row['articulo_id']} — {row['titulo']}")
-                    asunto = st.text_input("Asunto", value=f"Re: {row['articulo_id']} — {row['titulo']}")
-                    mensaje = st.text_area("Mensaje", height=150, placeholder="Escriba su mensaje aquí...")
+                    st.markdown(f"**Send email to:** {row['nombre_revisor']} <{row['email_revisor']}>")
+                    st.markdown(f"**Manuscript:** {row['articulo_id']} — {row['titulo']}")
+                    asunto = st.text_input("Subject", value=f"Re: {row['articulo_id']} — {row['titulo']}")
+                    mensaje = st.text_area("Message", height=150, placeholder="Type your message here...")
                     
                     cc1, cc2 = st.columns(2)
                     with cc1:
-                        if st.form_submit_button("📧 Enviar", use_container_width=True):
+                        if st.form_submit_button("📧 Send", use_container_width=True):
                             if not mensaje.strip():
-                                st.error("El mensaje no puede estar vacío.")
+                                st.error("The message cannot be empty.")
                             else:
                                 package_bytes = None
                                 package_filename = None
@@ -1511,7 +1496,7 @@ def tab_assignments():
                                     sftp.close()
                                     transport.close()
                                 except Exception as e:
-                                    print(f"[WARN] No se pudo leer el paquete: {e}")
+                                    print(f"[WARN] Could not read package: {e}")
 
                                 ok = notify_generic(
                                     row["email_revisor"],
@@ -1523,13 +1508,13 @@ def tab_assignments():
                                 )
                                 
                                 if ok:
-                                    st.success(f"Correo enviado a {row['email_revisor']}.")
+                                    st.success(f"Email sent to {row['email_revisor']}.")
                                     st.session_state[f"emailing_{idx}"] = False
                                     st.rerun()
                                 else:
-                                    st.error("Error al enviar el correo. Revise los logs de Streamlit.")
+                                    st.error("Error sending email. Check Streamlit logs.")
                     with cc2:
-                        if st.form_submit_button("❌ Cancelar", use_container_width=True):
+                        if st.form_submit_button("❌ Cancel", use_container_width=True):
                             st.session_state[f"emailing_{idx}"] = False
                             st.rerun()
 

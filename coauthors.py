@@ -1,6 +1,6 @@
 """
 RandPunkt Journal — Editorial panel: coauthor approval management.
-Incluye sistema de roles (Level 0 = Jefe, Level 1 = Asociado) y filtro de correos.
+Includes role system (Level 0 = Chief, Level 1 = Associate) and email filtering.
 """
 
 import io
@@ -204,7 +204,7 @@ def get_submission(tracking_id: str) -> dict | None:
         transport.close()
         return data
     except Exception as e:
-        print(f"[ERROR] No se pudo leer {tracking_id}.json: {e}")
+        print(f"[ERROR] Could not read {tracking_id}.json: {e}")
         return None
 
 # ============================================================
@@ -495,7 +495,7 @@ def editor_view():
 
         st.divider()
 
-        # --- INCLUIR AL AUTOR PARA CORRESPONDENCIA ---
+        # --- INCLUDE CORRESPONDING AUTHOR ---
         df_coauthors = read_coauthors()
         submission_data = get_submission(article_id)
         
@@ -504,7 +504,6 @@ def editor_view():
             author_name = author.get("name", "").strip()
             author_email = author.get("email", "").strip()
             if author_name and author_email:
-                # Añadir al autor si no está ya en la lista
                 if author_email not in df_coauthors["Email"].values:
                     new_author_row = pd.DataFrame([{"Nombre": author_name, "Email": author_email}])
                     df_coauthors = pd.concat([df_coauthors, new_author_row], ignore_index=True)
@@ -530,7 +529,6 @@ def editor_view():
             email = row["Email"]
             key = f"coauthor_{i}_{email}"
 
-            # FILTRO: No mostrar al editor actual en la lista de coautores
             if email.strip().lower() == editor_email_actual:
                 continue
 
@@ -584,7 +582,7 @@ def editor_view():
                 save_confirmations(df_conf)
 
                 if art_row["estado"] == "publicado":
-                    st.warning("Note: this item is already marked as 'publicado'.")
+                    st.warning("Note: this item is already marked as 'published'.")
                 elif art_row["estado"] != "pendiente_aprobacion":
                     df_art.loc[
                         df_art["articulo_id"] == article_id, "estado"
@@ -656,11 +654,11 @@ def editor_view():
                                         sent += 1
                                 st.success(f"Reminders sent: {sent}")
 
-                    # --- BOTÓN DE PUBLICAR (SOLO PARA EL EDITOR EN JEFE) ---
-                    if total > 0 and approved == total and art["estado"] != "publicado":
-                        if user_level == 0: # JEFE
+                    # --- PUBLISH BUTTON (ONLY FOR CHIEF EDITOR) ---
+                    if total > 0 and approved == total and art["estado"] != "published":
+                        if user_level == 0:
                             if st.button(
-                                f"🚀 Publicar {art['articulo_id']}",
+                                f"🚀 Publish {art['articulo_id']}",
                                 key=f"pub_{art['articulo_id']}",
                                 use_container_width=True,
                                 type="primary"
@@ -668,12 +666,12 @@ def editor_view():
                                 df_art.loc[
                                     df_art["articulo_id"] == art["articulo_id"],
                                     "estado",
-                                ] = "publicado"
+                                ] = "published"
                                 save_articles(df_art)
-                                st.success(f"{art['articulo_id']} publicado. Ahora aparece en el panel de libros/artículos finales.")
+                                st.success(f"{art['articulo_id']} published. Now visible in the public articles list.")
                                 st.rerun()
-                        else: # ASOCIADO
-                            st.info("Todos los coautores han aprobado. Esperando la publicación final del Editor en Jefe.")
+                        else:
+                            st.info("All coauthors have approved. Waiting for final publication by the Chief Editor.")
 
     # ---------- TAB 3: FULL LOG ----------
     with tab3:
@@ -728,7 +726,6 @@ def author_view(token: str):
     st.markdown(f"### {art['titulo']}")
     st.caption(f"Editorial reference: {article_id}")
 
-    # --- MOSTRAR EL PDF PARA DESCARGA ---
     st.markdown("### Manuscript File")
     df_ver = read_versions()
     versions_for_art = df_ver[df_ver["articulo_id"] == article_id]
@@ -736,11 +733,9 @@ def author_view(token: str):
     if versions_for_art.empty:
         st.warning("⚠️ No manuscript file has been uploaded yet.")
     else:
-        # Tomar la versión más reciente (ordenada por fecha descendente)
         latest_version = versions_for_art.sort_values("fecha", ascending=False).iloc[0]
         pdf_filename = latest_version["nombre_archivo"]
         
-        # Intentar leer el archivo desde el servidor SFTP
         try:
             transport, sftp = _sftp_connect()
             versions_dir = f"{st.secrets['remote_server']['dir'].rstrip('/')}/versiones"
@@ -817,7 +812,6 @@ def author_view(token: str):
             df_art.loc[df_art["articulo_id"] == article_id, "estado"] = "todos_aprobados"
             save_articles(df_art)
 
-            # Obtener el email del editor asociado asignado
             editor_asignado_login = art.get("editor_asignado", "")
             editor_email_dest = None
             if editor_asignado_login:
