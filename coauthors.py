@@ -7,6 +7,7 @@ import io
 import os
 import smtplib
 import time
+import json
 from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -188,6 +189,23 @@ def read_coauthors() -> pd.DataFrame:
     except Exception as e:
         st.error(f"Error reading coauthors from remote server: {e}")
         return pd.DataFrame(columns=COLS_COAUTORES)
+
+def get_submission(tracking_id: str) -> dict | None:
+    try:
+        transport, sftp = _sftp_connect()
+        rs = st.secrets["remote_server"]
+        revista_base = rs['revista_dir'].rstrip('/')
+        json_path = f"{revista_base}/METADATA/{tracking_id}.json"
+        
+        with sftp.open(json_path, "r") as f:
+            data = json.loads(f.read().decode("utf-8"))
+        
+        sftp.close()
+        transport.close()
+        return data
+    except Exception as e:
+        print(f"[ERROR] No se pudo leer {tracking_id}.json: {e}")
+        return None
 
 # ============================================================
 # TOKENS
@@ -477,13 +495,25 @@ def editor_view():
 
         st.divider()
 
+        # --- INCLUIR AL AUTOR PARA CORRESPONDENCIA ---
         df_coauthors = read_coauthors()
+        submission_data = get_submission(article_id)
+        
+        if submission_data:
+            author = submission_data.get("corresponding_author", {})
+            author_name = author.get("name", "").strip()
+            author_email = author.get("email", "").strip()
+            if author_name and author_email:
+                # Añadir al autor si no está ya en la lista
+                if author_email not in df_coauthors["Email"].values:
+                    new_author_row = pd.DataFrame([{"Nombre": author_name, "Email": author_email}])
+                    df_coauthors = pd.concat([df_coauthors, new_author_row], ignore_index=True)
 
         if df_coauthors.empty:
             st.warning("No coauthors found in the remote coauthors CSV.")
         else:
             st.info(
-                f"{len(df_coauthors)} coauthor(s) available."
+                f"{len(df_coauthors)} coauthor(s) available (including corresponding author)."
             )
 
         st.markdown("**Select the coauthors to notify:**")
@@ -626,18 +656,24 @@ def editor_view():
                                         sent += 1
                                 st.success(f"Reminders sent: {sent}")
 
+                    # --- BOTÓN DE PUBLICAR (SOLO PARA EL EDITOR EN JEFE) ---
                     if total > 0 and approved == total and art["estado"] != "publicado":
-                        if st.button(
-                            f"🚀 Mark {art['articulo_id']} as published",
-                            key=f"pub_{art['articulo_id']}",
-                        ):
-                            df_art.loc[
-                                df_art["articulo_id"] == art["articulo_id"],
-                                "estado",
-                            ] = "publicado"
-                            save_articles(df_art)
-                            st.success(f"{art['articulo_id']} marked as published.")
-                            st.rerun()
+                        if user_level == 0: # JEFE
+                            if st.button(
+                                f"🚀 Publicar {art['articulo_id']}",
+                                key=f"pub_{art['articulo_id']}",
+                                use_container_width=True,
+                                type="primary"
+                            ):
+                                df_art.loc[
+                                    df_art["articulo_id"] == art["articulo_id"],
+                                    "estado",
+                                ] = "publicado"
+                                save_articles(df_art)
+                                st.success(f"{art['articulo_id']} publicado. Ahora aparece en el panel de libros/artículos finales.")
+                                st.rerun()
+                        else: # ASOCIADO
+                            st.info("Todos los coautores han aprobado. Esperando la publicación final del Editor en Jefe.")
 
     # ---------- TAB 3: FULL LOG ----------
     with tab3:
@@ -781,7 +817,7 @@ def author_view(token: str):
             df_art.loc[df_art["articulo_id"] == article_id, "estado"] = "todos_aprobados"
             save_articles(df_art)
 
-            # Obtener el email del editor asignado
+            # Obtener el email del editor asociado asignado
             editor_asignado_login = art.get("editor_asignado", "")
             editor_email_dest = None
             if editor_asignado_login:

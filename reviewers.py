@@ -1,6 +1,7 @@
 """
 RandPunkt Journal — Editorial panel: reviewers and versions management.
-Incluye sistema de roles (Level 0 = Jefe, Level 1 = Asociado) y filtro de correos.
+Incluye sistema de roles (Level 0 = Jefe, Level 1 = Asociado), filtro de correos
+y publicación final en Zenodo exclusiva para el Editor en Jefe.
 """
 
 import io
@@ -10,6 +11,7 @@ import re
 import time
 import zipfile
 import smtplib
+import requests
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
@@ -48,7 +50,16 @@ COLS_VERSIONES = [
     "articulo_id", "fecha", "ruta_pdf", "nombre_archivo", "notas",
 ]
 
-ESTADOS_ACTIVOS = ["en_revision", "aceptado", "todos_aprobados", "publicado"]
+# Añadimos los nuevos estados al flujo
+ESTADOS_ACTIVOS = [
+    "en_revision", 
+    "aprobado_por_asociado", 
+    "listo_para_coautores", 
+    "aprobado_final",
+    "aceptado", 
+    "todos_aprobados", 
+    "publicado"
+]
 ESTADOS_RETIRADOS = ["retirado"]
 MOTIVOS_RETIRO = [
     "rechazado_por_revisores",
@@ -150,6 +161,125 @@ Comité Editorial
 RandPunkt Journal
 """
     return _send_email(recipient_email, subject, body, attachment_bytes, attachment_name)
+
+# ============================================================
+# ZENODO INTEGRATION
+# ============================================================
+def _get_zenodo_config():
+    """Lee las credenciales de Zenodo desde los secrets de Streamlit."""
+    zen = st.secrets.get("zenodo", {})
+    # Si no está configurado el sandbox, asume producción
+    if zen.get("sandbox", False):
+        return zen.get("sandbox_api", "https://sandbox.zenodo.org/api"), zen.get("sandbox_token", "")
+    return zen.get("api", "https://zenodo.org/api"), zen.get("token", "")
+
+def _zenodo_request(method: str, url: str, *, headers=None, json_data=None, data=None, timeout=30, max_retries=3):
+    last_exc = None
+    for attempt in range(max_retries):
+        try:
+            r = requests.request(method, url, headers=headers, json=json_data, data=data, timeout=timeout)
+            if r.status_code >= 500:
+                raise requests.HTTPError(f"{r.status_code}: {r.text}")
+            if r.status_code >= 400:
+                print(f"[ZENODO ERROR] {r.status_code}: {r.text}")
+            r.raise_for_status()
+            return r
+        except (requests.ConnectionError, requests.Timeout, requests.HTTPError) as e:
+            last_exc = e
+            wait = 2 ** attempt
+            time.sleep(wait)
+    raise last_exc
+
+def build_zenodo_metadata(submission: dict) -> dict:
+    """Construye el JSON de metadatos requerido por Zenodo."""
+    authors = []
+    ca = submission.get("corresponding_author", {})
+    authors.append({
+        "name": ca.get("name", "Unknown"),
+        "affiliation": ca.get("affiliation", ""),
+        "orcid": ca.get("orcid", "").replace("https://orcid.org/", ""),
+    })
+    for coauthor in submission.get("coauthors", []):
+        authors.append({"name": coauthor})
+
+    keywords = [k.strip() for k in submission.get("keywords", "").split(",") if k.strip()]
+    msc = submission.get("msc", {})
+    if msc.get("primary", {}).get("code"):
+        keywords.append(f"MSC {msc['primary']['code']}")
+    for sec in msc.get("secondary", []):
+        if sec.get("code"):
+            keywords.append(f"MSC {sec['code']}")
+
+    if submission.get("original_language"):
+        keywords.append(f"Original language: {submission['original_language']}")
+    if submission.get("original_format"):
+        keywords.append(f"Original format: {submission['original_format']}")
+
+    keywords.extend(["mathematics", "pure mathematics", "applied mathematics", "mathematical research", "peer-reviewed"])
+
+    type_map = {
+        "Short Note": "article",
+        "Scoped Expository Article": "article",
+        "Original Research Article": "article",
+        "Research Article": "article",
+        "Book": "book",
+        "Book Chapter": "section",
+    }
+
+    submitted = submission.get("submitted_at", "")
+    if not submitted:
+        versions = submission.get("versions", [])
+        if versions:
+            submitted = versions[0].get("submitted_at", "")
+    pub_date = submitted[:10] if len(submitted) >= 10 else "2026-01-01"
+
+    community = st.secrets.get("zenodo", {}).get("community", "randpunkt")
+
+    return {
+        "title": submission.get("titulo", "Untitled"),
+        "upload_type": "publication",
+        "publication_type": type_map.get(submission.get("article_type"), "article"),
+        "publication_date": pub_date,
+        "description": submission.get("abstract", ""),
+        "creators": authors,
+        "keywords": keywords,
+        "access_right": "open",
+        "license": "cc-by-4.0",
+        "communities": [{"identifier": community}],
+    }
+
+def publish_to_zenodo(articulo_id: str, submission_data: dict, pdf_path: str, pdf_bytes: bytes) -> tuple[bool, str]:
+    """Sube el PDF a Zenodo y publica el depósito. Devuelve (ok, mensaje)."""
+    try:
+        api_url, token = _get_zenodo_config()
+        if not token:
+            return False, "El token de Zenodo no está configurado en secrets.toml"
+
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        
+        # 1. Crear depósito
+        metadata = build_zenodo_metadata(submission_data)
+        payload = {"metadata": metadata}
+        r = _zenodo_request("POST", f"{api_url}/deposit/depositions", headers=headers, json_data=payload)
+        dep = r.json()
+        dep_id = dep["id"]
+        bucket_url = dep["links"]["bucket"]
+
+        # 2. Subir archivo
+        filename = f"{articulo_id}.pdf"
+        file_headers = {"Authorization": f"Bearer {token}"}
+        _zenodo_request("PUT", f"{bucket_url}/{filename}", headers=file_headers, data=pdf_bytes, timeout=300)
+
+        # 3. Publicar
+        r = _zenodo_request("POST", f"{api_url}/deposit/depositions/{dep_id}/actions/publish", headers=headers)
+        published = r.json()
+
+        doi = published.get("doi", "")
+        record_url = published.get("links", {}).get("record_html", "")
+        
+        return True, f"Publicado con éxito. DOI: {doi}"
+    except Exception as e:
+        return False, f"Error al publicar en Zenodo: {e}"
 
 # ============================================================
 # CSV READ/WRITE
@@ -694,6 +824,111 @@ def tab_articles():
 
             with c2:
                 st.write("**Actions**")
+
+                # ========================================================
+                # BLOQUE: DECISIONES EDITORIALES Y PUBLICACIÓN
+                # ========================================================
+                st.markdown("---")
+                st.markdown("**Decisiones Editoriales**")
+                
+                estado_actual = row["estado"]
+
+                if user_level == 1: # EDITOR ASOCIADO
+                    if estado_actual == "en_revision":
+                        if st.button("✅ Aprobar Revisión (Enviar a Jefe)", key=f"app_asoc_{aid}", use_container_width=True, type="primary"):
+                            df_full = read_articles()
+                            df_full.loc[df_full["articulo_id"] == aid, "estado"] = "aprobado_por_asociado"
+                            if save_articles(df_full):
+                                append_log("APPROVE-ASSOC", aid, "Approved by associate, sent to chief editor")
+                                st.success("Aprobado por asociado. El Editor en Jefe ha sido notificado.")
+                                st.rerun()
+                                
+                    elif estado_actual == "listo_para_coautores":
+                        if st.button("✅ Dar Visto Bueno Final", key=f"app_final_{aid}", use_container_width=True, type="primary"):
+                            df_full = read_articles()
+                            df_full.loc[df_full["articulo_id"] == aid, "estado"] = "todos_aprobados"
+                            if save_articles(df_full):
+                                append_log("APPROVE-FINAL", aid, "Final approval by associate, ready for coauthors")
+                                st.success("Aprobación final registrada. Listo para el panel de coautores.")
+                                st.rerun()
+
+                elif user_level == 0: # EDITOR EN JEFE
+                    if estado_actual == "aprobado_por_asociado":
+                        st.info("Aprobado por el asociado. Realiza la edición, traducción y proofreading.")
+                        if st.button("📝 Confirmar Edición (Devolver al Asociado)", key=f"edit_chief_{aid}", use_container_width=True, type="primary"):
+                            df_full = read_articles()
+                            df_full.loc[df_full["articulo_id"] == aid, "estado"] = "listo_para_coautores"
+                            if save_articles(df_full):
+                                append_log("EDIT-CHIEF", aid, "Edition complete, returned to associate")
+                                st.success("Edición confirmada. El artículo ha vuelto al editor asociado.")
+                                st.rerun()
+
+                    elif estado_actual == "aprobado_final":
+                        if st.button("🚀 Dar Aprobado Final (Enviar a Coautores)", key=f"app_final_chief_{aid}", use_container_width=True, type="primary"):
+                            df_full = read_articles()
+                            df_full.loc[df_full["articulo_id"] == aid, "estado"] = "todos_aprobados"
+                            if save_articles(df_full):
+                                append_log("APPROVE-FINAL-CHIEF", aid, "Final approval by chief, ready for coauthors")
+                                st.success("Aprobado final. El artículo ya aparece en el panel de coautores.")
+                                st.rerun()
+
+                    elif estado_actual == "todos_aprobados":
+                        st.success("🎉 Todos los coautores han aprobado este manuscrito.")
+                        
+                        if st.button("🚀 PUBLICAR EN ZENODO", key=f"publish_zen_{aid}", use_container_width=True, type="primary"):
+                            with st.spinner("Subiendo a Zenodo..."):
+                                # 1. Descargar el PDF más reciente
+                                submission_data = get_submission(aid)
+                                if not submission_data:
+                                    st.error("No se encontró el JSON de metadatos.")
+                                else:
+                                    versions = submission_data.get("versions", [])
+                                    if not versions:
+                                        st.error("No hay versiones del PDF registradas.")
+                                    else:
+                                        latest_pdf = versions[-1]["pdf"]
+                                        rs = st.secrets["remote_server"]
+                                        versions_dir = f"{rs['dir'].rstrip('/')}/versiones"
+                                        pdf_path = f"{versions_dir}/{latest_pdf}"
+                                        
+                                        try:
+                                            transport, sftp = _sftp_connect()
+                                            with sftp.open(pdf_path, "rb") as f:
+                                                pdf_bytes = f.read()
+                                            sftp.close()
+                                            transport.close()
+                                        except Exception as e:
+                                            pdf_bytes = None
+                                            st.error(f"No se pudo leer el PDF: {e}")
+
+                                        if pdf_bytes:
+                                            ok, msg = publish_to_zenodo(aid, submission_data, pdf_path, pdf_bytes)
+                                            if ok:
+                                                # 2. Actualizar el JSON
+                                                submission_data["status"] = "published"
+                                                submission_data["zenodo"] = {"doi": msg.split("DOI: ")[-1], "url": ""}
+                                                try:
+                                                    transport, sftp = _sftp_connect()
+                                                    json_path = f"{rs['revista_dir'].rstrip('/')}/METADATA/{aid}.json"
+                                                    with sftp.open(json_path, "w") as f:
+                                                        f.write(json.dumps(submission_data, indent=2).encode("utf-8"))
+                                                    sftp.close()
+                                                    transport.close()
+                                                except Exception as e:
+                                                    st.warning(f"Publicado, pero no se pudo actualizar el JSON: {e}")
+
+                                                # 3. Actualizar el CSV
+                                                df_full = read_articles()
+                                                df_full.loc[df_full["articulo_id"] == aid, "estado"] = "publicado"
+                                                save_articles(df_full)
+                                                
+                                                append_log("PUBLISH-ZENODO", aid, msg)
+                                                st.balloons()
+                                                st.success(f"¡Publicación exitosa! {msg}")
+                                                st.rerun()
+                                            else:
+                                                st.error(msg)
+                # ========================================================
 
                 with st.form(f"upload_version_{aid}_{idx}"):
                     st.markdown("**Upload new version (PDF + ZIP)**")
