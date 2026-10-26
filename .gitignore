@@ -5,3 +5,11 @@ __pycache__/
 venv/
 .DS_Store
 *.log
+
+# --- Scripts de prueba y secretos locales ---
+tests/
+seed_*.py
+test_*.py
+reset_system.py
+test_flow.py
+*.bak
