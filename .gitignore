@@ -1,15 +1,21 @@
+# Secretos
 .streamlit/secrets.toml
+.env
+.env.*
+*.pem
+*.key
+
+# Python
 __pycache__/
 *.py[cod]
 .venv/
 venv/
-.DS_Store
+env/
+.pytest_cache/
+
+# Streamlit / Logs
+nohup.out
 *.log
 
-# --- Scripts de prueba y secretos locales ---
-tests/
-seed_*.py
-test_*.py
-reset_system.py
-test_flow.py
-*.bak
+# Datos generados
+uploads/
