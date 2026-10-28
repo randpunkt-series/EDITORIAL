@@ -248,7 +248,7 @@ def append_log(action, articulo_id, detail=""):
 
 
 # ============================================================
-# EMAIL (FUNCIÓN RESTAURADA)
+# EMAIL (FUNCIÓN CORREGIDA CON TUS VARIABLES REALES)
 # ============================================================
 def enviar_correo_asignacion(email_revisor, nombre_revisor, articulo_id, titulo_articulo):
     """Envía un correo al revisor cuando se le asigna un manuscrito."""
@@ -256,8 +256,10 @@ def enviar_correo_asignacion(email_revisor, nombre_revisor, articulo_id, titulo_
         email_conf = st.secrets.get("email", {})
         smtp_server = email_conf.get("smtp_server", "smtp.gmail.com")
         smtp_port = int(email_conf.get("smtp_port", 587))
-        sender_email = email_conf.get("gmail", "randpunkt@gmail.com")
-        sender_password = email_conf.get("password", "")
+        
+        # --- CORRECCIÓN: Leer sender_email y sender_password (tus variables reales) ---
+        sender_email = email_conf.get("sender_email", "randpunkt@gmail.com")
+        sender_password = email_conf.get("sender_password", "")
 
         if not sender_password:
             print("[EMAIL ERROR] No hay contraseña SMTP configurada en los secrets.")
