@@ -172,6 +172,11 @@ def read_coauthors():
         return pd.DataFrame(columns=COLS_COAUTORES)
 
 
+def save_coauthors(df):
+    """Guarda la lista de coautores en el archivo CSV remoto."""
+    return save_remote_csv(st.secrets["csv"]["coautores_file"], df)
+
+
 def get_submission(tracking_id):
     try:
         transport, sftp = _sftp_connect()
@@ -315,6 +320,24 @@ def editor_view():
                     ignore_index=True,
                 )
 
+        # --- NUEVO: Formulario para añadir o modificar coautores ---
+        st.markdown("---")
+        st.subheader("Add or modify a coauthor")
+        with st.form("add_coauthor_form"):
+            new_name = st.text_input("Name")
+            new_email = st.text_input("Email")
+            if st.form_submit_button("Add coauthor"):
+                if new_name and new_email:
+                    new_row = pd.DataFrame([{"Nombre": new_name, "Email": new_email}])
+                    df_coauthors = pd.concat([df_coauthors, new_row], ignore_index=True)
+                    df_coauthors = df_coauthors.drop_duplicates(subset=["Email"], keep="last").reset_index(drop=True)
+                    if save_coauthors(df_coauthors):
+                        st.success(f"Coauthor {new_name} added/modified.")
+                        st.rerun()
+                else:
+                    st.error("Please fill both fields.")
+
+        st.markdown("---")
         if df_coauthors.empty:
             st.warning("No coauthors available.")
         else:
@@ -334,9 +357,6 @@ def editor_view():
                 if checked and not already:
                     selected.append((name, email))
 
-            # Auto-seleccionar a todos los coautores nuevos (útil para
-            # envíos masivos y para tests E2E que no pueden manejar los
-            # checkboxes de Streamlit con facilidad).
             auto_send_all = st.checkbox(
                 "Auto-select all new coauthors (skip manual selection)",
                 value=True,
@@ -347,15 +367,13 @@ def editor_view():
             )
 
             if st.button("📨 Send approval requests", use_container_width=True, type="primary"):
-                # Si auto_send_all, añadir todos los coautores nuevos a `selected`
                 if auto_send_all:
                     for i, r in df_coauthors.iterrows():
                         name, email = r["Nombre"], r["Email"]
                         if email.strip().lower() == user_email:
-                            continue  # no invitar al usuario logueado
+                            continue
                         if email in existing_emails:
-                            continue  # ya invitado
-                        # Evitar duplicados con lo ya seleccionado manualmente
+                            continue
                         if (name, email) not in selected:
                             selected.append((name, email))
 
@@ -492,8 +510,6 @@ def author_view(token):
         except Exception as e:
             st.error(f"Could not load file: {e}")
 
-    # Buscar por token (único), no por email (puede repetirse si varios
-    # coautores comparten el mismo buzón, p.ej. cpg7000cpg@gmail.com).
     row = df_conf[(df_conf["articulo_id"] == article_id) & (df_conf["token"] == token)]
     if row.empty:
         st.error("Your record was not found.")
@@ -525,22 +541,28 @@ def author_view(token):
         st.success("Thank you! Your approval has been recorded.")
         st.balloons()
 
-        # Intentar auto-avance
+        # Intentar auto-avance (solo si todos firmaron y el editor confirmó)
         df_art_full = read_articles()
         df_conf_full = read_confirmations()
         res = wf.try_auto_advance_after_signature(df_art_full, df_conf_full, article_id)
+        
         if res.ok:
             save_articles(df_art_full)
-            st.info("All coauthors signed AND arbitration confirmed. "
+            st.info("✅ All coauthors signed AND arbitration confirmed. "
                     "Item advanced to 'todos_aprobados'.")
         else:
             row2 = df_art_full[df_art_full["articulo_id"] == article_id].iloc[0]
             if row2["estado"] == wf.STATE_EN_REVISION:
                 pend = wf.pending_coauthors(df_conf_full, article_id)
                 if not pend.empty:
-                    st.info(f"{len(pend)} coauthor(s) still pending.")
+                    st.info(f"⏳ {len(pend)} coauthor(s) still pending. "
+                            f"Please wait for them to sign.")
                 elif not wf.is_arbitraje_confirmado(row2):
-                    st.info("Waiting for the editor to confirm arbitration.")
+                    st.info("✅ All coauthors have signed. "
+                            "Waiting for the editor to confirm arbitration.")
+                else:
+                    st.warning("⚠️ All conditions met but the item did not advance. "
+                               "Please contact the Editor in Chief.")
 
 
 # ============================================================
