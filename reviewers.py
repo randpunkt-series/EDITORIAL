@@ -851,6 +851,62 @@ def tab_articles():
                                 st.error(f"Error: {result}")
                 # ----------------------------------------
 
+                # --- VISUALIZAR VERSIONES (leyendo del JSON, que es la fuente de verdad) ---
+                st.markdown("---")
+                st.markdown("**Versions available for download**")
+                
+                rs = st.secrets["remote_server"]
+                versions_dir = f"{rs['dir'].rstrip('/')}/versiones"
+                
+                submission_data = get_submission(aid)
+                if submission_data and submission_data.get("versions"):
+                    for ver in submission_data["versions"]:
+                        v_num = ver.get("version", 1)
+                        v_pdf = ver.get("pdf", "")
+                        v_zip = ver.get("supplementary_zip", "")
+                        v_date = ver.get("submitted_at", "")[:10]
+                        v_notes = ver.get("notes", "")
+                        
+                        st.markdown(f"**v{v_num}** ({v_date}) — {v_notes}")
+                        col_a, col_b = st.columns(2)
+                        if v_pdf:
+                            with col_a:
+                                if st.button(f"⬇️ PDF v{v_num}", key=f"dl_pdf_{aid}_{v_num}", use_container_width=True):
+                                    try:
+                                        transport, sftp = _sftp_connect()
+                                        with sftp.open(f"{versions_dir}/{v_pdf}", "rb") as f:
+                                            pdf_bytes = f.read()
+                                        sftp.close(); transport.close()
+                                        st.download_button(
+                                            label=f"Save PDF v{v_num}",
+                                            data=pdf_bytes,
+                                            file_name=v_pdf,
+                                            mime="application/pdf",
+                                            key=f"save_pdf_{aid}_{v_num}"
+                                        )
+                                    except Exception as e:
+                                        st.error(f"Error: {e}")
+                        if v_zip:
+                            with col_b:
+                                if st.button(f"⬇️ ZIP v{v_num}", key=f"dl_zip_{aid}_{v_num}", use_container_width=True):
+                                    try:
+                                        transport, sftp = _sftp_connect()
+                                        with sftp.open(f"{versions_dir}/{v_zip}", "rb") as f:
+                                            zip_bytes = f.read()
+                                        sftp.close(); transport.close()
+                                        st.download_button(
+                                            label=f"Save ZIP v{v_num}",
+                                            data=zip_bytes,
+                                            file_name=v_zip,
+                                            mime="application/zip",
+                                            key=f"save_zip_{aid}_{v_num}"
+                                        )
+                                    except Exception as e:
+                                        st.error(f"Error: {e}")
+                else:
+                    st.info("No versions registered in the metadata JSON.")
+
+                # --- ESTADOS ---
                 estado = row["estado"]
 
                 if estado == wf.STATE_EN_REVISION:

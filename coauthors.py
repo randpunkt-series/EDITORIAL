@@ -1,7 +1,7 @@
 """
 RandPunkt — Public coauthor approval view.
 Only the author_view (token-based signature) is kept.
-Includes automatic state advancement to 'todos_aprobados' when all coauthors sign.
+Reads the latest PDF directly from the metadata JSON.
 """
 from __future__ import annotations
 
@@ -191,26 +191,37 @@ def author_view(token):
     st.caption(f"Reference: {article_id}")
 
     st.markdown("### Manuscript File")
-    df_ver = read_versions()
-    vfa = df_ver[df_ver["articulo_id"] == article_id]
-    if vfa.empty:
-        st.warning("⚠️ No file uploaded yet.")
+    
+    # Leer el JSON de metadatos (fuente de verdad)
+    submission_data = get_submission(article_id)
+    if not submission_data:
+        st.warning("⚠️ Metadata JSON not found.")
     else:
-        latest = vfa.sort_values("fecha", ascending=False).iloc[0]
-        pdf_name = latest["nombre_archivo"]
-        try:
-            transport, sftp = _sftp_connect()
-            versions_dir = f"{st.secrets['remote_server']['dir'].rstrip('/')}/versiones"
-            with sftp.open(f"{versions_dir}/{pdf_name}", "rb") as f:
-                pdf_bytes = f.read()
-            sftp.close(); transport.close()
-            st.download_button(
-                "⬇️ Download Manuscript (PDF)",
-                data=pdf_bytes, file_name=pdf_name, mime="application/pdf",
-                use_container_width=True,
-            )
-        except Exception as e:
-            st.error(f"Could not load file: {e}")
+        versions_list = submission_data.get("versions", [])
+        if not versions_list:
+            st.warning("⚠️ No file uploaded yet.")
+        else:
+            # La última versión es la que está al final de la lista
+            latest = versions_list[-1]
+            pdf_name = latest.get("pdf", "")
+            
+            if not pdf_name:
+                st.warning("⚠️ No PDF file registered in the latest version.")
+            else:
+                try:
+                    transport, sftp = _sftp_connect()
+                    versions_dir = f"{st.secrets['remote_server']['dir'].rstrip('/')}/versiones"
+                    with sftp.open(f"{versions_dir}/{pdf_name}", "rb") as f:
+                        pdf_bytes = f.read()
+                    sftp.close(); transport.close()
+                    st.download_button(
+                        "⬇️ Download Manuscript (PDF)",
+                        data=pdf_bytes, file_name=pdf_name, mime="application/pdf",
+                        use_container_width=True,
+                    )
+                    st.caption(f"Version: v{latest.get('version', 1)} — {latest.get('notes', '')}")
+                except Exception as e:
+                    st.error(f"Could not load file: {e}")
 
     row = df_conf[(df_conf["articulo_id"] == article_id) & (df_conf["token"] == token)]
     if row.empty:
@@ -243,8 +254,7 @@ def author_view(token):
         st.success("Thank you! Your approval has been recorded.")
         st.balloons()
 
-        # --- AUTO-AVANCE DIRECTO (OPCIÓN A) ---
-        # Si todos los coautores de este artículo han firmado, cambiar estado a 'todos_aprobados'
+        # Auto-avance si todos firmaron (sin arbitraje)
         df_art_full = read_articles()
         df_conf_full = read_confirmations()
         
@@ -252,7 +262,6 @@ def author_view(token):
         todos_firmaron = (coautores_articulo["aprobado"] == "1").all()
         
         if todos_firmaron and not coautores_articulo.empty:
-            # Cambiar el estado directamente en registro_articulos.csv
             df_art_full.loc[df_art_full["articulo_id"] == article_id, "estado"] = "todos_aprobados"
             save_articles(df_art_full)
             st.info("✅ All coauthors have signed. The item has advanced to 'todos_aprobados'.")
