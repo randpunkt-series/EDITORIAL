@@ -20,6 +20,8 @@ import json
 import os
 import re
 import time
+import smtplib
+from email.mime.text import MIMEText
 from datetime import date, datetime
 from io import StringIO
 
@@ -243,6 +245,46 @@ def append_log(action, articulo_id, detail=""):
         sftp.close(); transport.close()
     except Exception as e:
         print(f"[LOG] {e}")
+
+
+# ============================================================
+# EMAIL (FUNCIÓN RESTAURADA)
+# ============================================================
+def enviar_correo_asignacion(email_revisor, nombre_revisor, articulo_id, titulo_articulo):
+    """Envía un correo al revisor cuando se le asigna un manuscrito."""
+    try:
+        email_conf = st.secrets.get("email", {})
+        smtp_server = email_conf.get("smtp_server", "smtp.gmail.com")
+        smtp_port = int(email_conf.get("smtp_port", 587))
+        sender_email = email_conf.get("gmail", "randpunkt@gmail.com")
+        sender_password = email_conf.get("password", "")
+
+        if not sender_password:
+            print("[EMAIL ERROR] No hay contraseña SMTP configurada en los secrets.")
+            return False
+
+        msg = MIMEText(
+            f"Hola {nombre_revisor},\n\n"
+            f"Se te ha asignado el manuscrito con ID: {articulo_id}\n"
+            f"Título: {titulo_articulo}\n\n"
+            f"Por favor, ingresa al panel de revisores para aceptar o rechazar esta asignación.\n\n"
+            f"Saludos,\nRandPunkt Journal"
+        )
+        msg['Subject'] = f"Nueva asignación de revisión: {articulo_id}"
+        msg['From'] = sender_email
+        msg['To'] = email_revisor
+
+        server = smtplib.SMTP(smtp_server, smtp_port)
+        server.starttls()
+        server.login(sender_email, sender_password)
+        server.send_message(msg)
+        server.quit()
+        
+        print(f"[EMAIL OK] Correo enviado a {email_revisor} para {articulo_id}")
+        return True
+    except Exception as e:
+        print(f"[EMAIL ERROR] Falló el envío a {email_revisor}: {e}")
+        return False
 
 
 # ============================================================
@@ -560,12 +602,23 @@ def tab_articles():
                     idx0 = opts.index(current) if current in opts else 0
                     selected = st.selectbox("Associate Editor", opts, index=idx0,
                                             key=f"assign_{aid}")
+                    
+                    # --- BOTÓN CON ENVÍO DE CORREO ---
                     if st.button("💾 Save assignment", key=f"save_assign_{aid}"):
                         new_val = "" if selected == "— Unassigned —" else selected
                         df_full = read_articles()
                         df_full.loc[df_full["articulo_id"] == aid, "editor_asignado"] = new_val
                         if save_articles(df_full):
                             append_log("ASSIGN-EDITOR", aid, f"→ {new_val or 'none'}")
+                            
+                            if new_val:
+                                revisor_info = df_ed[df_ed["login"] == new_val]
+                                if not revisor_info.empty:
+                                    email_rev = revisor_info.iloc[0]["email"]
+                                    enviar_correo_asignacion(
+                                        email_rev, new_val, aid, row["titulo"]
+                                    )
+                            
                             st.success("Assignment updated.")
                             st.rerun()
 
@@ -577,7 +630,6 @@ def tab_articles():
                 conf_sub = df_conf_all[df_conf_all["articulo_id"] == aid]
                 pend = wf.pending_coauthors(df_conf_all, aid)
 
-                # en_revision
                 if estado == wf.STATE_EN_REVISION:
                     st.info(f"Status: **en_revision** | Arbitration: "
                             f"{'✅ confirmed' if arbitraje_ok else '⏳ pending'}")
@@ -592,7 +644,6 @@ def tab_articles():
                                 res = wf.confirm_arbitraje(df_full, aid)
                                 if res.ok:
                                     save_articles(df_full)
-                                    # Intentar auto-avance
                                     auto = wf.try_auto_advance_after_signature(
                                         df_full, df_conf_all, aid
                                     )
@@ -627,7 +678,6 @@ def tab_articles():
                         st.caption(f"⏳ {len(pend)} coauthor(s) pending")
                         st.dataframe(pend[["nombre", "email"]], use_container_width=True)
 
-                # todos_aprobados
                 elif estado == wf.STATE_TODOS_APROBADOS:
                     st.success("🎉 Ready for publication.")
                     if is_chief:
@@ -697,7 +747,6 @@ def tab_articles():
                     else:
                         st.caption("Only the Chief Editor can publish.")
 
-                # published
                 elif estado == wf.STATE_PUBLISHED:
                     st.success("✅ Published")
                     sub = get_submission(aid) or {}
@@ -707,7 +756,6 @@ def tab_articles():
                     if z.get("url"):
                         st.write(f"**URL:** {z['url']}")
 
-                # retirado
                 elif estado == wf.STATE_RETIRADO:
                     st.warning(f"Retired: {row['motivo_retiro']}")
                     if is_chief:
@@ -721,7 +769,6 @@ def tab_articles():
                             else:
                                 st.error(res.message)
 
-                # Retirar
                 if estado in {wf.STATE_EN_REVISION, wf.STATE_TODOS_APROBADOS, wf.STATE_PUBLISHED}:
                     if is_chief or (row["editor_asignado"] == user_login):
                         st.markdown("---")
