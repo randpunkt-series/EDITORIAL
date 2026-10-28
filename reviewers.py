@@ -1,17 +1,14 @@
 """
-RandPunkt — Editorial panel (reviewers.py) — Versión minimalista v2.
+RandPunkt — Editorial panel (reviewers.py) — Versión integrada.
 
 Modelo de permisos:
-  - Associate (Level 1): aprueba arbitraje de productos asignados a él.
-  - Chief (Level 0): puede avanzar CUALQUIER transición, saltarse pasos,
-    y es el ÚNICO que puede publicar.
+  - Associate (Level 1): gestiona coautores y ve el estado de las firmas.
+  - Chief (Level 0): publica en Zenodo cuando el estado es 'todos_aprobados'.
 
-Modelo de estados (3 + retirado):
+Modelo de estados:
   en_revision  →  todos_aprobados  →  published
        ↘               ↘
               retirado
-
-La lógica de transición vive en `workflow.py` (fuente única de verdad).
 """
 from __future__ import annotations
 
@@ -28,6 +25,7 @@ from io import StringIO
 import pandas as pd
 import paramiko
 import streamlit as st
+from itsdangerous import URLSafeTimedSerializer
 
 from auth_utils import authenticate_user, logout_button
 import workflow as wf
@@ -45,13 +43,14 @@ COLS_ARTICULOS = [
     "idioma_original", "formato_original", "editor_asignado",
     "arbitraje_confirmado",
 ]
-COLS_REVISORES = [
-    "articulo_id", "titulo", "nombre_revisor", "email_revisor",
-    "fecha_envio_revision", "version", "notas",
-]
 COLS_VERSIONES = [
     "articulo_id", "fecha", "ruta_pdf", "nombre_archivo", "notas",
 ]
+COLS_CONFIRMACIONES = [
+    "articulo_id", "nombre", "email", "token",
+    "aprobado", "fecha_aprobacion", "comentarios",
+]
+COLS_COAUTORES = ["Nombre", "Email"]
 
 MOTIVOS_RETIRO = [
     "rejected_by_reviewers", "withdrawn_by_author", "author_unresponsive",
@@ -169,19 +168,44 @@ def read_articles():
 def save_articles(df):
     return _save_csv(st.secrets["csv"]["articulos_file"], df)
 
-def read_reviewers():
-    return _read_csv(st.secrets["csv"]["revisiones_file"], COLS_REVISORES)
-
-def save_reviewers(df):
-    return _save_csv(st.secrets["csv"]["revisiones_file"], df)
-
 def read_versions():
     return _read_csv(st.secrets["csv"]["versiones_file"], COLS_VERSIONES)
 
+def save_versions(df):
+    return _save_csv(st.secrets["csv"]["versiones_file"], df)
+
 def read_confirmations():
-    cols = ["articulo_id", "nombre", "email", "token",
-            "aprobado", "fecha_aprobacion", "comentarios"]
-    return _read_csv(st.secrets["csv"]["confirmaciones_file"], cols)
+    return _read_csv(st.secrets["csv"]["confirmaciones_file"], COLS_CONFIRMACIONES)
+
+def save_confirmations(df):
+    return _save_csv(st.secrets["csv"]["confirmaciones_file"], df)
+
+def read_coauthors():
+    try:
+        transport, sftp = _sftp_connect()
+        path = _remote_path(st.secrets["csv"]["coautores_file"])
+        try:
+            with sftp.open(path, "r") as f:
+                content = f.read().decode("utf-8")
+            df = pd.read_csv(io.StringIO(content), dtype=str, skipinitialspace=True).fillna("")
+            df.columns = [c.strip() for c in df.columns]
+            if "Nombre" not in df.columns or "Email" not in df.columns:
+                sftp.close(); transport.close()
+                return pd.DataFrame(columns=COLS_COAUTORES)
+            df["Nombre"] = df["Nombre"].str.strip()
+            df["Email"] = df["Email"].str.strip().str.replace(r"^<|>$", "", regex=True)
+            df = df[(df["Nombre"] != "") & (df["Email"] != "")].reset_index(drop=True)
+            sftp.close(); transport.close()
+            return df[COLS_COAUTORES]
+        except FileNotFoundError:
+            sftp.close(); transport.close()
+            return pd.DataFrame(columns=COLS_COAUTORES)
+    except Exception as e:
+        st.error(f"Error reading coauthors: {e}")
+        return pd.DataFrame(columns=COLS_COAUTORES)
+
+def save_coauthors(df):
+    return _save_csv(st.secrets["csv"]["coautores_file"], df)
 
 def read_editores():
     return _read_csv(st.secrets["csv"]["editores_file"],
@@ -248,7 +272,20 @@ def append_log(action, articulo_id, detail=""):
 
 
 # ============================================================
-# EMAIL (FUNCIÓN CORREGIDA CON TUS VARIABLES REALES)
+# TOKENS
+# ============================================================
+def get_serializer():
+    return URLSafeTimedSerializer(st.secrets["app"]["secret_key"])
+
+def generate_token(email, article_id, name):
+    return get_serializer().dumps(
+        {"email": email, "articulo_id": article_id, "nombre": name},
+        salt="aprobacion-autor",
+    )
+
+
+# ============================================================
+# EMAIL
 # ============================================================
 def enviar_correo_asignacion(email_revisor, nombre_revisor, articulo_id, titulo_articulo):
     """Envía un correo al revisor cuando se le asigna un manuscrito."""
@@ -256,8 +293,6 @@ def enviar_correo_asignacion(email_revisor, nombre_revisor, articulo_id, titulo_
         email_conf = st.secrets.get("email", {})
         smtp_server = email_conf.get("smtp_server", "smtp.gmail.com")
         smtp_port = int(email_conf.get("smtp_port", 587))
-        
-        # --- CORRECCIÓN: Leer sender_email y sender_password (tus variables reales) ---
         sender_email = email_conf.get("sender_email", "randpunkt@gmail.com")
         sender_password = email_conf.get("sender_password", "")
 
@@ -281,7 +316,6 @@ def enviar_correo_asignacion(email_revisor, nombre_revisor, articulo_id, titulo_
         server.login(sender_email, sender_password)
         server.send_message(msg)
         server.quit()
-        
         print(f"[EMAIL OK] Correo enviado a {email_revisor} para {articulo_id}")
         return True
     except Exception as e:
@@ -289,15 +323,49 @@ def enviar_correo_asignacion(email_revisor, nombre_revisor, articulo_id, titulo_
         return False
 
 
-# ============================================================
-# HELPERS
-# ============================================================
-def unique_reviewers(df_rev):
-    if df_rev.empty:
-        return pd.DataFrame(columns=["nombre_revisor", "email_revisor", "asignaciones"])
-    g = df_rev.groupby(["nombre_revisor", "email_revisor"], as_index=False).size()
-    g = g.rename(columns={"size": "asignaciones"})
-    return g.sort_values("nombre_revisor").reset_index(drop=True)
+def enviar_correo_coautor(email_coautor, nombre_coautor, articulo_id, titulo, link, is_reminder=False):
+    """Envía un correo de invitación o recordatorio a un coautor."""
+    try:
+        email_conf = st.secrets.get("email", {})
+        smtp_server = email_conf.get("smtp_server", "smtp.gmail.com")
+        smtp_port = int(email_conf.get("smtp_port", 587))
+        sender_email = email_conf.get("sender_email", "randpunkt@gmail.com")
+        sender_password = email_conf.get("sender_password", "")
+        sender_name = email_conf.get("sender_name", "RandPunkt Journal")
+
+        if not sender_password:
+            print("[EMAIL ERROR] No hay contraseña SMTP configurada.")
+            return False
+
+        prefix = "Recordatorio — " if is_reminder else ""
+        intro = ("Este es un recordatorio. Aún no hemos recibido tu aprobación."
+                 if is_reminder else
+                 "Como parte del proceso editorial, te pedimos revisar y aprobar el manuscrito antes de su publicación.")
+
+        msg = MIMEText(
+            f"Estimado/a {nombre_coautor},\n\n"
+            f"{intro}\n\n"
+            f"Manuscrito: \"{titulo}\"\n"
+            f"Referencia: {articulo_id}\n\n"
+            f"Por favor, haz clic en el siguiente enlace para confirmar tu aprobación:\n\n"
+            f"{link}\n\n"
+            f"El enlace es personal e intransferible, y expira en 30 días.\n\n"
+            f"Saludos cordiales,\n{sender_name}"
+        )
+        msg['Subject'] = f"{prefix}[RandPunkt] Aprobación requerida: {titulo}"
+        msg['From'] = f"{sender_name} <{sender_email}>"
+        msg['To'] = email_coautor
+
+        server = smtplib.SMTP(smtp_server, smtp_port)
+        server.starttls()
+        server.login(sender_email, sender_password)
+        server.send_message(msg)
+        server.quit()
+        print(f"[EMAIL OK] Correo enviado a {email_coautor} para {articulo_id}")
+        return True
+    except Exception as e:
+        print(f"[EMAIL ERROR] Falló el envío a {email_coautor}: {e}")
+        return False
 
 
 # ============================================================
@@ -381,7 +449,7 @@ def import_from_revista():
                     append_log("IMPORT", r["articulo_id"], r["titulo"])
         if new_ver_rows:
             df_ver = pd.concat([df_ver, pd.DataFrame(new_ver_rows)], ignore_index=True)
-            _save_csv(st.secrets["csv"]["versiones_file"], df_ver)
+            save_versions(df_ver)
         sftp.close(); transport.close()
         return imported, errors
     except Exception as e:
@@ -389,7 +457,7 @@ def import_from_revista():
 
 
 # ============================================================
-# ZENODO (real, solo si simulate=False)
+# ZENODO
 # ============================================================
 def _get_zenodo_config():
     zen = st.secrets.get("zenodo", {})
@@ -487,7 +555,7 @@ def publish_to_zenodo_real(articulo_id, submission_data, pdf_bytes):
 
 
 # ============================================================
-# TAB 1: MANUSCRIPTS AND BOOKS
+# TAB 1: MANUSCRIPTS AND BOOKS (CON GESTIÓN DE COAUTORES)
 # ============================================================
 def tab_articles():
     st.subheader("📚 Manuscripts and books")
@@ -498,6 +566,7 @@ def tab_articles():
 
     user_level = st.session_state.get("editor_level", 1)
     user_login = st.session_state.get("editor_login", "")
+    editor_email_actual = st.session_state.get("editor_email", "").strip().lower()
     is_chief = (user_level == 0)
 
     if is_chief:
@@ -571,7 +640,6 @@ def tab_articles():
                 if row["tipo"] == "libro" and row["isbn"]:
                     st.write(f"**ISBN:** {row['isbn']}")
                 st.write(f"**Status:** `{row['estado']}`")
-                st.write(f"**Arbitration confirmed:** `{row.get('arbitraje_confirmado', '0') or '0'}`")
                 st.write(f"**Creation date:** {row['fecha_creacion']}")
 
                 sub = get_submission(aid)
@@ -583,16 +651,93 @@ def tab_articles():
                         st.write(f"**Name:** {a.get('name', '—')}")
                         st.write(f"**Email:** `{a.get('email', '—')}`")
 
-                conf_sub = df_conf_all[df_conf_all["articulo_id"] == aid]
-                if not conf_sub.empty:
-                    st.markdown("---")
-                    st.markdown("**Coauthor signatures**")
-                    n_ok = int((conf_sub["aprobado"] == "1").sum())
-                    st.write(f"{n_ok}/{len(conf_sub)} signed")
+                # --- GESTIÓN DE COAUTORES (Integrada) ---
+                st.markdown("---")
+                st.markdown("**Coauthors**")
+
+                df_conf = read_confirmations()
+                existing = df_conf[df_conf["articulo_id"] == aid]
+                if not existing.empty:
                     st.dataframe(
-                        conf_sub[["nombre", "email", "aprobado", "fecha_aprobacion"]],
+                        existing[["nombre", "email", "aprobado", "fecha_aprobacion"]],
                         use_container_width=True,
                     )
+                else:
+                    st.info("No coauthors invited yet.")
+
+                # Formulario para añadir/modificar coautor
+                with st.expander("➕ Add or modify a coauthor"):
+                    with st.form(f"add_coauthor_{aid}"):
+                        new_name = st.text_input("Name", key=f"new_name_{aid}")
+                        new_email = st.text_input("Email", key=f"new_email_{aid}")
+                        if st.form_submit_button("Add coauthor", use_container_width=True):
+                            if new_name and new_email:
+                                df_coauthors = read_coauthors()
+                                new_row = pd.DataFrame([{"Nombre": new_name, "Email": new_email}])
+                                df_coauthors = pd.concat([df_coauthors, new_row], ignore_index=True)
+                                df_coauthors = df_coauthors.drop_duplicates(subset=["Email"], keep="last").reset_index(drop=True)
+                                if save_coauthors(df_coauthors):
+                                    st.success(f"Coauthor {new_name} added.")
+                                    st.rerun()
+                            else:
+                                st.error("Please fill both fields.")
+
+                # Botón para invitar a todos los coautores no invitados
+                if st.button("📨 Request Coauthors", key=f"req_coauth_{aid}", use_container_width=True, type="primary"):
+                    sub = get_submission(aid)
+                    if not sub:
+                        st.error("Metadata JSON not found.")
+                    else:
+                        df_coauthors = read_coauthors()
+                        author = sub.get("corresponding_author", {})
+                        a_name = author.get("name", "").strip()
+                        a_email = author.get("email", "").strip()
+                        if a_name and a_email and a_email not in df_coauthors["Email"].values:
+                            new_row = pd.DataFrame([{"Nombre": a_name, "Email": a_email}])
+                            df_coauthors = pd.concat([df_coauthors, new_row], ignore_index=True)
+
+                        if df_coauthors.empty:
+                            st.warning("No coauthors available.")
+                        else:
+                            existing_emails = set(existing["email"].tolist()) if not existing.empty else set()
+                            base_url = st.secrets["app"]["base_url"].rstrip("/")
+                            df_conf = read_confirmations()
+                            ok = 0
+                            for _, r in df_coauthors.iterrows():
+                                name = r["Nombre"]
+                                email = r["Email"]
+                                if email.strip().lower() == editor_email_actual:
+                                    continue
+                                if email in existing_emails:
+                                    continue
+                                token = generate_token(email, aid, name)
+                                link = f"{base_url}/?token={token}"
+                                if enviar_correo_coautor(email, name, aid, row["titulo"], link):
+                                    df_conf = pd.concat([df_conf, pd.DataFrame([{
+                                        "articulo_id": aid,
+                                        "nombre": name,
+                                        "email": email,
+                                        "token": token,
+                                        "aprobado": "0",
+                                        "fecha_aprobacion": "",
+                                        "comentarios": "",
+                                    }])], ignore_index=True)
+                                    ok += 1
+                            save_confirmations(df_conf)
+                            st.success(f"✅ Sent {ok} invitation(s).")
+                            st.rerun()
+
+                # Botón para enviar recordatorios
+                pending = existing[existing["aprobado"] == "0"] if not existing.empty else pd.DataFrame()
+                if not pending.empty:
+                    if st.button(f"🔔 Remind {len(pending)} pending coauthor(s)", key=f"remind_{aid}", use_container_width=True):
+                        base_url = st.secrets["app"]["base_url"].rstrip("/")
+                        sent = 0
+                        for _, p in pending.iterrows():
+                            link = f"{base_url}/?token={p['token']}"
+                            if enviar_correo_coautor(p["email"], p["nombre"], aid, row["titulo"], link, is_reminder=True):
+                                sent += 1
+                        st.success(f"Reminders sent: {sent}")
 
                 if is_chief:
                     st.markdown("---")
@@ -604,23 +749,17 @@ def tab_articles():
                     idx0 = opts.index(current) if current in opts else 0
                     selected = st.selectbox("Associate Editor", opts, index=idx0,
                                             key=f"assign_{aid}")
-                    
-                    # --- BOTÓN CON ENVÍO DE CORREO ---
                     if st.button("💾 Save assignment", key=f"save_assign_{aid}"):
                         new_val = "" if selected == "— Unassigned —" else selected
                         df_full = read_articles()
                         df_full.loc[df_full["articulo_id"] == aid, "editor_asignado"] = new_val
                         if save_articles(df_full):
                             append_log("ASSIGN-EDITOR", aid, f"→ {new_val or 'none'}")
-                            
                             if new_val:
                                 revisor_info = df_ed[df_ed["login"] == new_val]
                                 if not revisor_info.empty:
                                     email_rev = revisor_info.iloc[0]["email"]
-                                    enviar_correo_asignacion(
-                                        email_rev, new_val, aid, row["titulo"]
-                                    )
-                            
+                                    enviar_correo_asignacion(email_rev, new_val, aid, row["titulo"])
                             st.success("Assignment updated.")
                             st.rerun()
 
@@ -628,37 +767,9 @@ def tab_articles():
             with c2:
                 st.write("**Actions**")
                 estado = row["estado"]
-                arbitraje_ok = wf.is_arbitraje_confirmado(row)
-                conf_sub = df_conf_all[df_conf_all["articulo_id"] == aid]
-                pend = wf.pending_coauthors(df_conf_all, aid)
 
                 if estado == wf.STATE_EN_REVISION:
-                    st.info(f"Status: **en_revision** | Arbitration: "
-                            f"{'✅ confirmed' if arbitraje_ok else '⏳ pending'}")
-
-                    if not arbitraje_ok:
-                        can = is_chief or (row["editor_asignado"] == user_login)
-                        if can:
-                            if st.button("✅ Confirm arbitration",
-                                         key=f"conf_arb_{aid}",
-                                         use_container_width=True, type="primary"):
-                                df_full = read_articles()
-                                res = wf.confirm_arbitraje(df_full, aid)
-                                if res.ok:
-                                    save_articles(df_full)
-                                    auto = wf.try_auto_advance_after_signature(
-                                        df_full, df_conf_all, aid
-                                    )
-                                    if auto.ok:
-                                        save_articles(df_full)
-                                        append_log("AUTO-ADV", aid, auto.message)
-                                    append_log("CONFIRM-ARB", aid, "Arbitration confirmed")
-                                    st.success(res.message)
-                                    st.rerun()
-                                else:
-                                    st.error(res.message)
-                        else:
-                            st.caption("Only assigned associate or Chief.")
+                    st.info(f"Status: **en_revision**")
 
                     if is_chief:
                         st.markdown("---")
@@ -674,11 +785,6 @@ def tab_articles():
                                 st.rerun()
                             else:
                                 st.error(res.message)
-
-                    if not pend.empty:
-                        st.markdown("---")
-                        st.caption(f"⏳ {len(pend)} coauthor(s) pending")
-                        st.dataframe(pend[["nombre", "email"]], use_container_width=True)
 
                 elif estado == wf.STATE_TODOS_APROBADOS:
                     st.success("🎉 Ready for publication.")
@@ -802,43 +908,6 @@ def tab_articles():
 
 
 # ============================================================
-# TAB 2: REVIEWERS
-# ============================================================
-def tab_reviewers():
-    st.subheader("👤 Reviewers")
-    df_rev = read_reviewers()
-    if st.session_state.get("editor_level", 1) == 1:
-        df_art = read_articles()
-        mine = df_art[df_art["editor_asignado"] == st.session_state["editor_login"]]["articulo_id"].tolist()
-        df_rev = df_rev[df_rev["articulo_id"].isin(mine)]
-    df_uniq = unique_reviewers(df_rev)
-    if df_uniq.empty:
-        st.info("No reviewers yet.")
-        return
-    st.dataframe(df_uniq, use_container_width=True)
-
-
-# ============================================================
-# TAB 3: ASSIGNMENTS
-# ============================================================
-def tab_assignments():
-    st.subheader("🔗 Assignments")
-    is_chief = st.session_state.get("editor_level", 0) == 0
-    user_login = st.session_state.get("editor_login", "")
-    df_art = read_articles()
-    if not is_chief:
-        df_art = df_art[df_art["editor_asignado"] == user_login]
-    df_art = df_art[df_art["estado"].isin(
-        [wf.STATE_EN_REVISION, wf.STATE_TODOS_APROBADOS, wf.STATE_PUBLISHED]
-    )]
-    if df_art.empty:
-        st.info("No active products.")
-        return
-    df_rev = read_reviewers()
-    st.dataframe(df_rev, use_container_width=True)
-
-
-# ============================================================
 # MAIN
 # ============================================================
 def main():
@@ -847,18 +916,7 @@ def main():
     logout_button()
 
     st.title("🧑‍⚖️ Reviewers Management")
-
-    tab1, tab2, tab3 = st.tabs([
-        "📄 Manuscripts and books",
-        "👤 Reviewers",
-        "🔗 Assignments",
-    ])
-    with tab1:
-        tab_articles()
-    with tab2:
-        tab_reviewers()
-    with tab3:
-        tab_assignments()
+    tab_articles()
 
 
 if __name__ == "__main__":
