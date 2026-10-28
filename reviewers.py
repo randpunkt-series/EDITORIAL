@@ -943,56 +943,71 @@ def tab_articles():
                             st.warning("No Zenodo credentials. Keep simulation ON.")
                         if st.button("🚀 PUBLISH", key=f"pub_{aid}",
                                      use_container_width=True, type="primary"):
-                            real_pub = None
-                            if not simulate:
-                                sub = get_submission(aid)
-                                vs = (sub or {}).get("versions", [])
-                                pdf_name = vs[-1]["pdf"] if vs else ""
-                                pdf_bytes = None
-                                if pdf_name:
-                                    try:
-                                        transport, sftp = _sftp_connect()
-                                        rs = st.secrets["remote_server"]
-                                        revista_base = rs.get("revista_dir",
-                                            rs["dir"].rsplit("/editorial", 1)[0]).rstrip("/")
-                                        versions_dir = f"{rs['dir'].rstrip('/')}/versiones"
-                                        for p in [f"{versions_dir}/{pdf_name}",
-                                                  f"{revista_base}/PDF/{pdf_name}",
-                                                  f"{revista_base}/BOOKS/pdf/{aid}.pdf"]:
-                                            try:
-                                                with sftp.open(p, "rb") as f:
-                                                    pdf_bytes = f.read()
-                                                break
-                                            except Exception:
-                                                continue
-                                        sftp.close(); transport.close()
-                                    except Exception as e:
-                                        st.error(f"Could not read PDF: {e}")
-                                if pdf_bytes and sub:
-                                    real_pub = lambda a, s=sub, b=pdf_bytes: publish_to_zenodo_real(a, s, b)
-                                else:
-                                    st.error("Cannot publish: PDF not found.")
-                            if simulate or real_pub is not None:
+                            if simulate:
+                                # --- MODO SIMULACIÓN ---
                                 df_full = read_articles()
-                                res = wf.publish(df_full, aid, simulate=simulate,
-                                                 real_publisher=real_pub)
+                                res = wf.publish(df_full, aid, simulate=True, real_publisher=None)
                                 if res.ok:
                                     save_articles(df_full)
                                     sub = get_submission(aid) or {}
                                     sub["status"] = "published"
                                     sub["zenodo"] = {
-                                        "doi": res.doi, "url": res.url,
-                                        "environment": "simulated" if simulate else "real",
+                                        "doi": res.doi,
+                                        "url": "",
+                                        "environment": "simulated",
                                         "published_at": datetime.now().isoformat(timespec="seconds"),
                                     }
                                     save_submission_json(aid, sub)
-                                    append_log("PUBLISH", aid,
-                                               f"DOI {res.doi} (sim={simulate})")
+                                    append_log("PUBLISH-SIM", aid, f"DOI {res.doi}")
                                     st.balloons()
-                                    st.success(res.message)
+                                    st.success(f"Simulated publication. DOI: {res.doi}")
                                     st.rerun()
                                 else:
                                     st.error(res.message)
+                            else:
+                                # --- MODO REAL (ZENODO) ---
+                                sub = get_submission(aid)
+                                if not sub:
+                                    st.error("Metadata JSON not found.")
+                                else:
+                                    vs = (sub or {}).get("versions", [])
+                                    pdf_name = vs[-1]["pdf"] if vs else ""
+                                    pdf_bytes = None
+                                    if pdf_name:
+                                        try:
+                                            transport, sftp = _sftp_connect()
+                                            rs = st.secrets["remote_server"]
+                                            versions_dir = f"{rs['dir'].rstrip('/')}/versiones"
+                                            with sftp.open(f"{versions_dir}/{pdf_name}", "rb") as f:
+                                                pdf_bytes = f.read()
+                                            sftp.close(); transport.close()
+                                        except Exception as e:
+                                            st.error(f"Could not read PDF: {e}")
+                                    
+                                    if pdf_bytes:
+                                        ok, doi_or_error, url = publish_to_zenodo_real(aid, sub, pdf_bytes)
+                                        if ok:
+                                            sub["status"] = "published"
+                                            sub["zenodo"] = {
+                                                "doi": doi_or_error,
+                                                "url": url,
+                                                "environment": "real",
+                                                "published_at": datetime.now().isoformat(timespec="seconds"),
+                                            }
+                                            save_submission_json(aid, sub)
+                                            
+                                            df_full = read_articles()
+                                            df_full.loc[df_full["articulo_id"] == aid, "estado"] = "published"
+                                            save_articles(df_full)
+                                            
+                                            append_log("PUBLISH-REAL", aid, f"DOI {doi_or_error}")
+                                            st.balloons()
+                                            st.success(f"✅ Published on Zenodo! DOI: {doi_or_error}")
+                                            st.rerun()
+                                        else:
+                                            st.error(f"Zenodo error: {doi_or_error}")
+                                    else:
+                                        st.error("Cannot publish: PDF not found.")
                     else:
                         st.caption("Only the Chief Editor can publish.")
 
