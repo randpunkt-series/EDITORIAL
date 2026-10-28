@@ -1,6 +1,7 @@
 """
 RandPunkt — Public coauthor approval view.
 Only the author_view (token-based signature) is kept.
+Includes automatic state advancement to 'todos_aprobados' when all coauthors sign.
 """
 from __future__ import annotations
 
@@ -242,22 +243,25 @@ def author_view(token):
         st.success("Thank you! Your approval has been recorded.")
         st.balloons()
 
-        # Auto-avance si todos firmaron (sin arbitraje)
+        # --- AUTO-AVANCE DIRECTO (OPCIÓN A) ---
+        # Si todos los coautores de este artículo han firmado, cambiar estado a 'todos_aprobados'
         df_art_full = read_articles()
         df_conf_full = read_confirmations()
-        res = wf.try_auto_advance_after_signature(df_art_full, df_conf_full, article_id)
         
-        if res.ok:
+        coautores_articulo = df_conf_full[df_conf_full["articulo_id"] == article_id]
+        todos_firmaron = (coautores_articulo["aprobado"] == "1").all()
+        
+        if todos_firmaron and not coautores_articulo.empty:
+            # Cambiar el estado directamente en registro_articulos.csv
+            df_art_full.loc[df_art_full["articulo_id"] == article_id, "estado"] = "todos_aprobados"
             save_articles(df_art_full)
-            st.info("✅ All coauthors signed. Item advanced to 'todos_aprobados'.")
+            st.info("✅ All coauthors have signed. The item has advanced to 'todos_aprobados'.")
         else:
-            row2 = df_art_full[df_art_full["articulo_id"] == article_id].iloc[0]
-            if row2["estado"] == wf.STATE_EN_REVISION:
-                pend = wf.pending_coauthors(df_conf_full, article_id)
-                if not pend.empty:
-                    st.info(f"⏳ {len(pend)} coauthor(s) still pending. Please wait for them to sign.")
-                else:
-                    st.info("✅ All coauthors have signed. The item is being processed.")
+            pend = coautores_articulo[coautores_articulo["aprobado"] == "0"]
+            if not pend.empty:
+                st.info(f"⏳ {len(pend)} coauthor(s) still pending. Please wait for them to sign.")
+            else:
+                st.info("✅ All coauthors have signed. The item is being processed.")
 
 
 # ============================================================

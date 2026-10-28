@@ -2,7 +2,7 @@
 RandPunkt — Editorial panel (reviewers.py) — Versión integrada.
 
 Modelo de permisos:
-  - Associate (Level 1): gestiona coautores y ve el estado de las firmas.
+  - Associate (Level 1): gestiona coautores y sube versiones.
   - Chief (Level 0): publica en Zenodo cuando el estado es 'todos_aprobados'.
 
 Modelo de estados:
@@ -366,6 +366,68 @@ def enviar_correo_coautor(email_coautor, nombre_coautor, articulo_id, titulo, li
     except Exception as e:
         print(f"[EMAIL ERROR] Falló el envío a {email_coautor}: {e}")
         return False
+
+
+# ============================================================
+# UPLOAD VERSION
+# ============================================================
+def upload_version(articulo_id: str, pdf_bytes: bytes, zip_bytes: bytes, pdf_name: str, zip_name: str, notas: str) -> tuple[bool, str]:
+    try:
+        transport, sftp = _sftp_connect()
+        versions_dir = f"{st.secrets['remote_server']['dir'].rstrip('/')}/versiones"
+        _ensure_remote_dir(sftp, versions_dir)
+
+        submission_data = get_submission(articulo_id)
+        if not submission_data:
+            return False, "Metadata JSON not found."
+
+        current_version = submission_data.get("current_version", 1)
+        next_version = current_version + 1
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_pdf = re.sub(r"[^A-Za-z0-9._-]", "_", pdf_name)
+        safe_zip = re.sub(r"[^A-Za-z0-9._-]", "_", zip_name)
+        pdf_remote_name = f"{articulo_id}_v{next_version}_{ts}_{safe_pdf}"
+        zip_remote_name = f"{articulo_id}_v{next_version}_{ts}_{safe_zip}"
+        pdf_remote_path = f"{versions_dir}/{pdf_remote_name}"
+        zip_remote_path = f"{versions_dir}/{zip_remote_name}"
+
+        with sftp.open(pdf_remote_path, "wb") as f:
+            f.write(pdf_bytes)
+        with sftp.open(zip_remote_path, "wb") as f:
+            f.write(zip_bytes)
+
+        submission_data["current_version"] = next_version
+        submission_data["versions"].append({
+            "version": next_version,
+            "submitted_at": datetime.now().isoformat(timespec="seconds"),
+            "pdf": pdf_remote_name,
+            "supplementary_zip": zip_remote_name,
+            "notes": notas or f"Version {next_version} uploaded by editor",
+        })
+
+        rs = st.secrets["remote_server"]
+        revista_base = rs['revista_dir'].rstrip('/')
+        json_path = f"{revista_base}/METADATA/{articulo_id}.json"
+        with sftp.open(json_path, "w") as f:
+            f.write(json.dumps(submission_data, indent=2).encode("utf-8"))
+
+        df_ver = read_versions()
+        new_row = {
+            "articulo_id": articulo_id,
+            "fecha": datetime.now().isoformat(timespec="seconds"),
+            "ruta_pdf": f"versiones/{pdf_remote_name}",
+            "nombre_archivo": pdf_remote_name,
+            "notas": notas or f"Version {next_version} uploaded by editor",
+        }
+        df_ver = pd.concat([df_ver, pd.DataFrame([new_row])], ignore_index=True)
+        save_versions(df_ver)
+
+        sftp.close()
+        transport.close()
+        append_log("UPLOAD", articulo_id, f"v{next_version} — {pdf_remote_name} + {zip_remote_name} — {notas}")
+        return True, f"v{next_version}"
+    except Exception as e:
+        return False, str(e)
 
 
 # ============================================================
@@ -766,6 +828,29 @@ def tab_articles():
             # --- ACTIONS ---
             with c2:
                 st.write("**Actions**")
+
+                # --- SUBIR NUEVA VERSIÓN (PDF + ZIP) ---
+                st.markdown("---")
+                with st.form(f"upload_version_{aid}_{idx}"):
+                    st.markdown("**Upload new version (PDF + ZIP)**")
+                    pdf_file = st.file_uploader("PDF", type=["pdf"], key=f"pdf_file_{aid}_{idx}")
+                    zip_file = st.file_uploader("Supplementary ZIP", type=["zip"], key=f"zip_file_{aid}_{idx}")
+                    notas = st.text_input("Version notes", value="", key=f"notas_{aid}_{idx}")
+                    if st.form_submit_button("⬆️ Upload Version", use_container_width=True):
+                        if pdf_file is None or zip_file is None:
+                            st.error("You must select both the PDF and the ZIP.")
+                        else:
+                            ok, result = upload_version(
+                                aid, pdf_file.getbuffer(), zip_file.getbuffer(),
+                                pdf_file.name, zip_file.name, notas.strip()
+                            )
+                            if ok:
+                                st.success(f"Version {result} uploaded successfully.")
+                                st.rerun()
+                            else:
+                                st.error(f"Error: {result}")
+                # ----------------------------------------
+
                 estado = row["estado"]
 
                 if estado == wf.STATE_EN_REVISION:
