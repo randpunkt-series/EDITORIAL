@@ -1220,24 +1220,19 @@ def tab_articles():
                         if new_val and new_val not in df_ed["login"].tolist():
                             st.error(f"El login '{new_val}' no existe en editores.csv. No se guarda.")
                         else:
-                            lock = _acquire_lock(aid)
-                            if not lock:
-                                st.error("Manuscrito bloqueado por otro editor.")
-                            else:
-                                try:
-                                    df_full = read_articles()
-                                    df_full.loc[df_full["articulo_id"] == aid, "editor_asignado"] = new_val
-                                    if save_articles(df_full):
-                                        append_log("ASSIGN-EDITOR", aid, f"→ {new_val or 'none'}")
-                                        if new_val:
-                                            revisor_info = df_ed[df_ed["login"] == new_val]
-                                            if not revisor_info.empty:
-                                                email_rev = revisor_info.iloc[0]["email"]
-                                                enviar_correo_asignacion(email_rev, new_val, aid, row["titulo"])
-                                        st.success("Assignment updated.")
-                                        st.rerun()
-                                finally:
-                                    _release_lock(aid)
+                            # NOTA: Ya no usamos lock para asignar, evitando el bug de "bloqueado"
+                            df_full = read_articles()
+                            df_full.loc[df_full["articulo_id"] == aid, "editor_asignado"] = new_val
+                            if save_articles(df_full):
+                                append_log("ASSIGN-EDITOR", aid, f"→ {new_val or 'none'}")
+                                if new_val:
+                                    revisor_info = df_ed[df_ed["login"] == new_val]
+                                    if not revisor_info.empty:
+                                        email_rev = revisor_info.iloc[0]["email"]
+                                        enviar_correo_asignacion(email_rev, new_val, aid, row["titulo"])
+                                st.success("Assignment updated.")
+                                time.sleep(1) # Pausa para que se vea el mensaje
+                                st.rerun()
 
             # ================= DERECHA =================
             with c2:
