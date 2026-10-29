@@ -326,7 +326,7 @@ def _read_csv(filename, columns):
         try:
             with sftp.open(path, "r") as f:
                 content = f.read().decode("utf-8")
-            df = pd.read_csv(io.StringIO(content), dtype=str).fillna("")
+            df = pd.read_csv(io.StringIO(content), dtype=str, keep_default_na=False).fillna("")
             for c in columns:
                 if c not in df.columns:
                     df[c] = ""
@@ -1221,7 +1221,7 @@ def tab_articles():
                     st.markdown("---")
                     st.markdown("**Assign / reassign editor**")
                     df_ed = read_editores()
-                    l1 = df_ed[df_ed["level"] == 1]["login"].tolist() if "level" in df_ed else []
+                    l1 = df_ed[df_ed["level"].astype(str) == "1"]["login"].tolist() if "level" in df_ed else []
                     current = row["editor_asignado"]
                     opts = ["— Unassigned —"] + l1
                     idx0 = opts.index(current) if current in opts else 0
