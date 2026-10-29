@@ -11,7 +11,7 @@ Modelo de estados:
               retirado
 
 Robustez aplicada:
-  - Lock por manuscrito (SFTP, atómico con O_EXCL).
+  - Lock por manuscrito (SFTP, atómico con O_EXCL) con auto-limpieza de locks huérfanos.
   - Lock global para confirmaciones.csv (evita colisión entre manuscritos).
   - Validación de editor_asignado contra editores.csv.
   - Idempotencia Zenodo (reusa deposition_id guardado en el JSON).
@@ -85,6 +85,7 @@ MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024  # 20 MB (límite SMTP prudente)
 
 LOCK_TIMEOUT_SEC = 30
 LOCK_RETRY_SEC = 0.5
+LOCK_MAX_AGE = 120  # Segundos antes de considerar un lock como huérfano
 
 # Lock global para confirmaciones.csv: nombre especial reservado
 CONF_LOCK_NAME = "__confirmaciones__"
@@ -184,6 +185,14 @@ def _acquire_lock(name: str, timeout: int = LOCK_TIMEOUT_SEC) -> str | None:
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:
+                # Auto-limpieza: Si el lock existe y tiene más de LOCK_MAX_AGE, lo rompemos
+                try:
+                    attr = sftp.stat(path)
+                    if time.time() - attr.st_mtime > LOCK_MAX_AGE:
+                        sftp.remove(path)
+                except IOError:
+                    pass
+
                 f = sftp.open(path, "x")  # O_EXCL: falla si existe
                 f.write(
                     json.dumps({
@@ -597,16 +606,6 @@ def enviar_correo_coautor(email_coautor, nombre_coautor, articulo_id,
         f"Adjuntamos el PDF de la última versión. Confirma tu aprobación aquí:\n\n{link}\n\n"
         f"El enlace es personal e intransferible y expira en 30 días.\n\nRandPunkt Journal",
         attachments=attachments,
-    )
-
-
-def _mailto_link(to_email: str, subject: str, body: str) -> str:
-    if not to_email:
-        return ""
-    return (
-        f"mailto:{urllib.parse.quote(to_email)}"
-        f"?subject={urllib.parse.quote(subject)}"
-        f"&body={urllib.parse.quote(body)}"
     )
 
 
@@ -1069,18 +1068,6 @@ def tab_articles():
                         st.write(f"**Email:** `{a.get('email', '—')}`")
                         if a.get("affiliation"):
                             st.write(f"**Affiliation:** {a.get('affiliation')}")
-                        if a.get("email"):
-                            subject = f"[RandPunkt] {aid} — {row['titulo']}"
-                            body = (
-                                f"Estimado/a {a.get('name', '')},\n\n"
-                                f"Le escribo en relación con el manuscrito \"{row['titulo']}\" "
-                                f"(Ref. {aid}).\n\nSaludos cordiales,\n"
-                            )
-                            st.link_button(
-                                "✉️ Write to author from my email",
-                                _mailto_link(a["email"], subject, body),
-                                use_container_width=True,
-                            )
 
                 # --- COAUTORES ---
                 st.markdown("---")
