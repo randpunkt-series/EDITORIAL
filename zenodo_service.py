@@ -1,20 +1,34 @@
 import time
 import requests
+import streamlit as st
 from pathlib import Path
 
-from config import (
-    ZENODO_TOKEN, ZENODO_API, ZENODO_COMMUNITY,
-    ZENODO_SANDBOX_TOKEN, ZENODO_SANDBOX_API,
-)
-
 
 # ==================================================================
-# CONFIGURACIÓN SEGÚN ENTORNO
+# CONFIGURACIÓN SEGÚN ENTORNO (LEE DE st.secrets)
 # ==================================================================
 def _get_config(use_sandbox: bool = False):
+    """
+    Lee las credenciales de Zenodo desde los secrets de Streamlit.
+    Si use_sandbox=True, usa el sandbox; si no, usa producción.
+    """
+    zen = st.secrets.get("zenodo", {})
+    
+    # Si no hay configuración, lanzamos un error claro
+    if not zen:
+        raise RuntimeError(
+            "La sección [zenodo] no está configurada en secrets.toml. "
+            "Añade las credenciales de Zenodo."
+        )
+
     if use_sandbox:
-        return ZENODO_SANDBOX_API, ZENODO_SANDBOX_TOKEN
-    return ZENODO_API, ZENODO_TOKEN
+        api = zen.get("sandbox_api", "https://sandbox.zenodo.org/api")
+        token = zen.get("sandbox_token", "")
+    else:
+        api = zen.get("api", "https://zenodo.org/api")
+        token = zen.get("token", "")
+        
+    return api, token
 
 
 # ==================================================================
@@ -52,7 +66,7 @@ def create_deposition(metadata: dict, use_sandbox: bool = False) -> dict:
         raise RuntimeError(
             f"Token de Zenodo no configurado para "
             f"{'sandbox' if use_sandbox else 'producción'}. "
-            f"Revisa tu archivo .env."
+            f"Revisa tu archivo secrets.toml."
         )
 
     headers = {
@@ -147,6 +161,10 @@ def build_manuscript_zenodo_metadata(metadata: dict) -> dict:
             submitted = versions[0].get("submitted_at", "")
     pub_date = submitted[:10] if len(submitted) >= 10 else "2026-01-01"
 
+    # Leer la comunidad desde secrets
+    zen = st.secrets.get("zenodo", {})
+    community = zen.get("community", "randpunkt")
+
     return {
         "title": metadata["titulo"],
         "upload_type": "publication",
@@ -157,5 +175,5 @@ def build_manuscript_zenodo_metadata(metadata: dict) -> dict:
         "keywords": keywords,
         "access_right": "open",
         "license": "cc-by-4.0",
-        "communities": [{"identifier": ZENODO_COMMUNITY}],
+        "communities": [{"identifier": community}],
     }
