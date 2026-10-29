@@ -809,13 +809,22 @@ def publish_to_zenodo_idempotent(articulo_id, submission_data, pdf_bytes):
         headers_json = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
         metadata = build_zenodo_metadata(submission_data)
 
-        zen = submission_data.setdefault("zenodo", {})
+        # Asegurarnos de que zen sea un diccionario (evita el 'NoneType' object has no attribute 'get')
+        zen = submission_data.get("zenodo")
+        if not isinstance(zen, dict):
+            zen = {}
+            submission_data["zenodo"] = zen
+
         dep_id = zen.get("deposition_id")
 
         if not dep_id:
             r = _zenodo_request("POST", f"{api_url}/deposit/depositions",
                                 headers=headers_json, json_data={"metadata": metadata})
             dep = r.json()
+            
+            if "id" not in dep or "links" not in dep:
+                return False, f"Respuesta inesperada de Zenodo: {str(dep)[:200]}", ""
+
             dep_id = dep["id"]
             bucket_url = dep["links"]["bucket"]
             zen["deposition_id"] = dep_id
@@ -830,8 +839,10 @@ def publish_to_zenodo_idempotent(articulo_id, submission_data, pdf_bytes):
             if not bucket_url:
                 r = _zenodo_request("GET", f"{api_url}/deposit/depositions/{dep_id}",
                                     headers=headers_json)
-                bucket_url = r.json()["links"]["bucket"]
+                dep_info = r.json()
+                bucket_url = dep_info.get("links", {}).get("bucket", "")
                 zen["bucket_url"] = bucket_url
+                
             filename = f"{articulo_id}.pdf"
             _zenodo_request("PUT", f"{bucket_url}/{filename}",
                             headers={"Authorization": f"Bearer {token}",
@@ -846,6 +857,10 @@ def publish_to_zenodo_idempotent(articulo_id, submission_data, pdf_bytes):
                                 f"{api_url}/deposit/depositions/{dep_id}/actions/publish",
                                 headers=headers_json)
             published = r.json()
+            
+            if "doi" not in published and "links" not in published:
+                return False, f"Error al publicar en Zenodo: {str(published)[:200]}", ""
+
             zen["doi"] = published.get("doi", "")
             zen["url"] = published.get("links", {}).get("record_html", "")
             zen["published"] = True
