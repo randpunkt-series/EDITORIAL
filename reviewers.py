@@ -143,7 +143,7 @@ def _cleanup_old_backups(sftp, base_name: str, keep_days: int = 30):
 
 
 # ============================================================
-# LOCKS (Solo para artículos y versiones)
+# LOCKS
 # ============================================================
 def _lock_path(name: str) -> str:
     rs = st.secrets["remote_server"]
@@ -323,10 +323,6 @@ def _read_csv(filename, columns):
 
 
 def _save_csv(filename, df, use_global_lock: bool = False):
-    """
-    Guarda un CSV de forma atómica.
-    use_global_lock ya no se usa, se mantiene por compatibilidad.
-    """
     try:
         transport, sftp = _sftp_connect()
         path = _remote_path(filename)
@@ -864,13 +860,15 @@ def publish_to_zenodo_idempotent(articulo_id, submission_data, pdf_bytes):
 
 
 # ============================================================
-# AVANCE AUTOMÁTICO A "todos_aprobados"
+# AVANCE AUTOMÁTICO A "todos_aprobados" (FORZADO/SINCRONIZADO)
 # ============================================================
 def _advance_if_all_approved(articulo_id: str) -> tuple[bool, str]:
     df_conf = read_confirmations()
     conf = df_conf[df_conf["articulo_id"] == articulo_id]
+    
     if conf.empty:
         return False, "Sin coautores invitados."
+        
     pending = conf[conf["aprobado"] != "1"]
     if not pending.empty:
         return False, f"Pendientes: {len(pending)} coautor(es)."
@@ -879,21 +877,21 @@ def _advance_if_all_approved(articulo_id: str) -> tuple[bool, str]:
     mask = df_art["articulo_id"] == articulo_id
     if not mask.any():
         return False, "Artículo no encontrado."
-    if df_art.loc[mask, "estado"].iloc[0] == wf.STATE_TODOS_APROBADOS:
+        
+    estado_actual = df_art.loc[mask, "estado"].iloc[0]
+    
+    if estado_actual == wf.STATE_TODOS_APROBADOS:
         return False, "Ya está en 'todos_aprobados'."
-
-    lock = _acquire_lock(articulo_id)
-    if not lock:
-        return False, "Bloqueado por otro editor."
-    try:
+        
+    if estado_actual == wf.STATE_EN_REVISION:
         df_art.loc[mask, "estado"] = wf.STATE_TODOS_APROBADOS
         df_art.loc[mask, "arbitraje_confirmado"] = "1"
+        
         if save_articles(df_art):
-            append_log("AUTO-ADV", articulo_id, "Todos los coautores aprobaron.")
-            return True, "✅ Todos los coautores aprobaron. Estado → todos_aprobados."
-        return False, "No se pudo guardar el estado."
-    finally:
-        _release_lock(articulo_id)
+            append_log("AUTO-ADV", articulo_id, "Todos los coautores aprobaron (sincronizado desde el panel).")
+            return True, "✅ Todos los coautores aprobaron. Estado actualizado a 'todos_aprobados'."
+            
+    return False, "No se pudo actualizar el estado (el artículo ya no está en revisión)."
 
 
 # ============================================================
