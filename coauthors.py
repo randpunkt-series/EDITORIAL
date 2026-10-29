@@ -45,7 +45,6 @@ COLS_VERSIONES = [
 ]
 
 TOKEN_MAX_AGE_SEC = 30 * 86400
-CONF_LOCK_NAME = "__confirmaciones__"
 LOCK_TIMEOUT_SEC = 30
 LOCK_RETRY_SEC = 0.5
 
@@ -96,7 +95,7 @@ def _ensure_remote_dir(sftp, path: str):
                 _log_error(f"mkdir {current}", e)
 
 # ============================================================
-# LOCKS
+# LOCKS (Solo para el auto-avance, no para confirmaciones)
 # ============================================================
 def _lock_path(name: str) -> str:
     rs = st.secrets["remote_server"]
@@ -226,12 +225,10 @@ def read_remote_csv(filename, columns):
         return pd.DataFrame(columns=columns)
 
 def save_remote_csv(filename, df, use_global_lock: bool = False):
-    lock_acquired = False
-    if use_global_lock:
-        lock_acquired = _acquire_lock(CONF_LOCK_NAME)
-        if not lock_acquired:
-            st.error("Could not acquire lock. Please retry in a few seconds.")
-            return False
+    """
+    Guarda un CSV de forma atómica.
+    use_global_lock ya no se usa (siempre False).
+    """
     try:
         transport, sftp = _sftp_connect()
         path = _remote_path(filename)
@@ -257,9 +254,6 @@ def save_remote_csv(filename, df, use_global_lock: bool = False):
         _log_error(f"save {filename}", e)
         st.error(f"Error saving {filename}: {e}")
         return False
-    finally:
-        if lock_acquired:
-            _release_lock(CONF_LOCK_NAME)
 
 def read_articles():
     return read_remote_csv(st.secrets["csv"]["articulos_file"], COLS_ARTICULOS)
@@ -271,14 +265,12 @@ def read_confirmations():
     return read_remote_csv(st.secrets["csv"]["confirmaciones_file"], COLS_CONFIRMACIONES)
 
 def save_confirmations(df):
+    """Escritura de confirmaciones.csv sin lock."""
     return save_remote_csv(
         st.secrets["csv"]["confirmaciones_file"],
         df,
-        use_global_lock=True,
+        use_global_lock=False,
     )
-
-def read_versions():
-    return read_remote_csv(st.secrets["csv"]["versiones_file"], COLS_VERSIONES)
 
 # ============================================================
 # JSON
@@ -300,28 +292,6 @@ def get_submission(tracking_id):
     except Exception as e:
         _log_error(f"get_submission {tracking_id}", e)
         return None
-
-def save_submission_json(tracking_id, data):
-    try:
-        transport, sftp = _sftp_connect()
-        base = _revista_base()
-        if tracking_id.startswith("BK-"):
-            json_path = f"{base}/BOOKS/metadata/{tracking_id}.json"
-        else:
-            json_path = f"{base}/METADATA/{tracking_id}.json"
-        tmp = f"{json_path}.tmp"
-        with sftp.open(tmp, "w") as f:
-            f.write(json.dumps(data, indent=2).encode("utf-8"))
-        try:
-            sftp.remove(json_path)
-        except IOError:
-            pass
-        sftp.rename(tmp, json_path)
-        sftp.close(); transport.close()
-        return True
-    except Exception as e:
-        _log_error(f"save_submission_json {tracking_id}", e)
-        return False
 
 # ============================================================
 # TOKENS
@@ -485,7 +455,7 @@ def author_view(token: str):
         st.warning("You must check the box to approve.")
         return
 
-    # 7) Guardar aprobación bajo lock global
+    # 7) Guardar aprobación
     df_conf2 = read_confirmations()
     df_conf2["email_norm"] = df_conf2["email"].apply(_normalize_email)
     df_conf2["aid_norm"] = df_conf2["articulo_id"].apply(_normalize_id)

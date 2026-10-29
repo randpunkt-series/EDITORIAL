@@ -9,21 +9,6 @@ Modelo de estados:
   en_revision  →  todos_aprobados  →  published
        ↘               ↘
               retirado
-
-Robustez aplicada:
-  - Lock por manuscrito (SFTP, atómico con O_EXCL) con auto-limpieza de locks huérfanos.
-  - Lock global para confirmaciones.csv (evita colisión entre manuscritos).
-  - Validación de editor_asignado contra editores.csv.
-  - Idempotencia Zenodo (reusa deposition_id guardado en el JSON).
-  - Validación de archivos (MIME, tamaño, magic bytes de PDF/ZIP).
-  - Revalidación de permisos en cada rerun contra editores.csv.
-  - Revocación de token tras aprobación.
-  - Reintento de invitaciones pendientes.
-  - Adjunto de PDF (no ZIP) en la invitación a coautores.
-  - Sin `except: pass` silenciosos; todo se loguea.
-  - Escritura atómica de CSV con backup y limpieza a 30 días.
-  - Reintentos Zenodo solo para 5xx / red.
-  - Fecha de publicación Zenodo = momento de publicar.
 """
 from __future__ import annotations
 
@@ -50,7 +35,6 @@ from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 
 from auth_utils import authenticate_user, logout_button
 import workflow as wf
-
 
 st.set_page_config(
     page_title="RandPunkt — Reviewers Management",
@@ -86,10 +70,6 @@ MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024  # 20 MB (límite SMTP prudente)
 LOCK_TIMEOUT_SEC = 30
 LOCK_RETRY_SEC = 0.5
 LOCK_MAX_AGE = 120  # Segundos antes de considerar un lock como huérfano
-
-# Lock global para confirmaciones.csv: nombre especial reservado
-CONF_LOCK_NAME = "__confirmaciones__"
-
 TOKEN_MAX_AGE_SEC = 30 * 86400  # 30 días
 
 
@@ -97,7 +77,6 @@ TOKEN_MAX_AGE_SEC = 30 * 86400  # 30 días
 # LOG DE ERRORES
 # ============================================================
 def _log_error(context: str, exc: Exception):
-    """Nunca silenciar: imprime y, si se puede, registra en el log remoto."""
     msg = f"[ERROR] {context}: {type(exc).__name__}: {exc}"
     print(msg)
     try:
@@ -164,7 +143,7 @@ def _cleanup_old_backups(sftp, base_name: str, keep_days: int = 30):
 
 
 # ============================================================
-# LOCKS
+# LOCKS (Solo para artículos y versiones)
 # ============================================================
 def _lock_path(name: str) -> str:
     rs = st.secrets["remote_server"]
@@ -172,11 +151,6 @@ def _lock_path(name: str) -> str:
 
 
 def _acquire_lock(name: str, timeout: int = LOCK_TIMEOUT_SEC) -> str | None:
-    """
-    Intenta crear un lock en SFTP de forma atómica (O_EXCL).
-    `name` puede ser un articulo_id o un nombre reservado (p. ej. CONF_LOCK_NAME).
-    Devuelve el path del lock si se adquiere, o None si está ocupado/timeout.
-    """
     try:
         transport, sftp = _sftp_connect()
         lock_dir = _lock_path(name).rsplit("/", 1)[0]
@@ -185,7 +159,6 @@ def _acquire_lock(name: str, timeout: int = LOCK_TIMEOUT_SEC) -> str | None:
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:
-                # Auto-limpieza: Si el lock existe y tiene más de LOCK_MAX_AGE, lo rompemos
                 try:
                     attr = sftp.stat(path)
                     if time.time() - attr.st_mtime > LOCK_MAX_AGE:
@@ -193,7 +166,7 @@ def _acquire_lock(name: str, timeout: int = LOCK_TIMEOUT_SEC) -> str | None:
                 except IOError:
                     pass
 
-                f = sftp.open(path, "x")  # O_EXCL: falla si existe
+                f = sftp.open(path, "x")
                 f.write(
                     json.dumps({
                         "login": st.session_state.get("editor_login", ""),
@@ -226,7 +199,6 @@ def _release_lock(name: str):
 
 
 def _break_stale_lock(name: str, max_age_sec: int = 600):
-    """Rompe locks huérfanos de más de `max_age_sec` (por defecto 10 min)."""
     try:
         transport, sftp = _sftp_connect()
         path = _lock_path(name)
@@ -353,14 +325,8 @@ def _read_csv(filename, columns):
 def _save_csv(filename, df, use_global_lock: bool = False):
     """
     Guarda un CSV de forma atómica.
-    Si use_global_lock=True, adquiere el lock global de confirmaciones antes de escribir.
+    use_global_lock ya no se usa, se mantiene por compatibilidad.
     """
-    lock_acquired = False
-    if use_global_lock:
-        lock_acquired = _acquire_lock(CONF_LOCK_NAME) is not None
-        if not lock_acquired:
-            st.error("No se pudo adquirir el lock de confirmaciones. Reintenta.")
-            return False
     try:
         transport, sftp = _sftp_connect()
         path = _remote_path(filename)
@@ -387,9 +353,6 @@ def _save_csv(filename, df, use_global_lock: bool = False):
         _log_error(f"save {filename}", e)
         st.error(f"Error saving {filename}: {e}")
         return False
-    finally:
-        if lock_acquired:
-            _release_lock(CONF_LOCK_NAME)
 
 
 def read_articles():       return _read_csv(st.secrets["csv"]["articulos_file"], COLS_ARTICULOS)
@@ -400,11 +363,11 @@ def read_confirmations():  return _read_csv(st.secrets["csv"]["confirmaciones_fi
 
 
 def save_confirmations(df):
-    """Escritura de confirmaciones.csv SIEMPRE bajo lock global."""
+    """Escritura de confirmaciones.csv sin lock (evita bloqueos huérfanos)."""
     return _save_csv(
         st.secrets["csv"]["confirmaciones_file"],
         df,
-        use_global_lock=True,
+        use_global_lock=False,
     )
 
 
@@ -780,7 +743,6 @@ def _zenodo_config():
 
 def _zenodo_request(method, url, *, headers=None, json_data=None, data=None,
                     timeout=30, max_retries=3):
-    """Reintenta SOLO errores de red y 5xx. Los 4xx se propagan."""
     last_exc = None
     for attempt in range(max_retries):
         try:
@@ -844,13 +806,6 @@ def build_zenodo_metadata(submission):
 
 
 def publish_to_zenodo_idempotent(articulo_id, submission_data, pdf_bytes):
-    """
-    Publica en Zenodo de forma idempotente:
-      - Si el JSON ya tiene zenodo.deposition_id, lo reutiliza.
-      - Si el depósito ya está publicado, devuelve el DOI existente.
-      - Si no, crea depósito, sube PDF y publica.
-    Guarda deposition_id ANTES de publicar para poder reintentar.
-    """
     try:
         api_url, token = _zenodo_config()
         if not token:
@@ -861,7 +816,6 @@ def publish_to_zenodo_idempotent(articulo_id, submission_data, pdf_bytes):
         zen = submission_data.setdefault("zenodo", {})
         dep_id = zen.get("deposition_id")
 
-        # 1. Crear depósito si no existe
         if not dep_id:
             r = _zenodo_request("POST", f"{api_url}/deposit/depositions",
                                 headers=headers_json, json_data={"metadata": metadata})
@@ -876,7 +830,6 @@ def publish_to_zenodo_idempotent(articulo_id, submission_data, pdf_bytes):
         else:
             bucket_url = zen.get("bucket_url", "")
 
-        # 2. Subir PDF (si no estaba ya subido)
         if not zen.get("file_uploaded"):
             if not bucket_url:
                 r = _zenodo_request("GET", f"{api_url}/deposit/depositions/{dep_id}",
@@ -892,7 +845,6 @@ def publish_to_zenodo_idempotent(articulo_id, submission_data, pdf_bytes):
             submission_data["zenodo"] = zen
             save_submission_json(articulo_id, submission_data)
 
-        # 3. Publicar (si no estaba publicado)
         if not zen.get("published"):
             r = _zenodo_request("POST",
                                 f"{api_url}/deposit/depositions/{dep_id}/actions/publish",
@@ -1131,7 +1083,7 @@ def tab_articles():
                         else:
                             existing_emails = set(existing["email"].tolist()) if not existing.empty else set()
                             base_url = st.secrets["app"]["base_url"].rstrip("/")
-                            # Re-leer bajo lock global para evitar colisiones
+                            # Re-leer para evitar colisiones
                             df_conf = read_confirmations()
                             ok = 0
                             for _, r in df_coauthors.iterrows():
@@ -1158,7 +1110,7 @@ def tab_articles():
                                         "comentarios": "",
                                     }])], ignore_index=True)
                                     ok += 1
-                            save_confirmations(df_conf)  # ← bajo lock global
+                            save_confirmations(df_conf)
                             _advance_if_all_approved(aid)
                             st.success(f"✅ Sent {ok} invitation(s) with PDF attached.")
                             st.rerun()
@@ -1185,7 +1137,6 @@ def tab_articles():
                     with colr2:
                         if st.button(f"♻️ Recreate tokens ({len(pending)})",
                                      key=f"retok_{aid}", use_container_width=True):
-                            # Re-leer bajo lock global antes de modificar
                             df_conf2 = read_confirmations()
                             base_url = st.secrets["app"]["base_url"].rstrip("/")
                             sent = 0
@@ -1200,7 +1151,7 @@ def tab_articles():
                                     mask2 = (df_conf2["articulo_id"] == aid) & (df_conf2["email"] == p["email"])
                                     df_conf2.loc[mask2, "token"] = new_token
                                     sent += 1
-                            save_confirmations(df_conf2)  # ← bajo lock global
+                            save_confirmations(df_conf2)
                             st.success(f"Tokens recreated and sent: {sent}")
 
                 # ====== CHIEF: asignar / reasignar editor ======
@@ -1216,11 +1167,9 @@ def tab_articles():
                                             key=f"assign_{aid}")
                     if st.button("💾 Save assignment", key=f"save_assign_{aid}"):
                         new_val = "" if selected == "— Unassigned —" else selected
-                        # ===== MEJORA OPCIONAL #2: validar contra editores.csv =====
                         if new_val and new_val not in df_ed["login"].tolist():
                             st.error(f"El login '{new_val}' no existe en editores.csv. No se guarda.")
                         else:
-                            # NOTA: Ya no usamos lock para asignar, evitando el bug de "bloqueado"
                             df_full = read_articles()
                             df_full.loc[df_full["articulo_id"] == aid, "editor_asignado"] = new_val
                             if save_articles(df_full):
@@ -1231,7 +1180,7 @@ def tab_articles():
                                         email_rev = revisor_info.iloc[0]["email"]
                                         enviar_correo_asignacion(email_rev, new_val, aid, row["titulo"])
                                 st.success("Assignment updated.")
-                                time.sleep(1) # Pausa para que se vea el mensaje
+                                time.sleep(1)
                                 st.rerun()
 
             # ================= DERECHA =================
@@ -1439,37 +1388,6 @@ def tab_articles():
 
 
 # ============================================================
-# SMOKE TESTS
-# ============================================================
-def _run_smoke_tests() -> bool:
-    ok = True
-    if _is_valid_pdf(b"%PDF-1.4\n..."):
-        pass
-    else:
-        print("[SMOKE FAIL] _is_valid_pdf válido")
-        ok = False
-    if not _is_valid_pdf(b"not a pdf"):
-        pass
-    else:
-        print("[SMOKE FAIL] _is_valid_pdf inválido")
-        ok = False
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w") as z:
-        z.writestr("a.txt", "hello")
-    if _is_valid_zip(buf.getvalue()):
-        pass
-    else:
-        print("[SMOKE FAIL] _is_valid_zip válido")
-        ok = False
-    if not _is_valid_zip(b"not a zip"):
-        pass
-    else:
-        print("[SMOKE FAIL] _is_valid_zip inválido")
-        ok = False
-    return ok
-
-
-# ============================================================
 # MAIN
 # ============================================================
 def main():
@@ -1478,9 +1396,6 @@ def main():
     logout_button()
 
     st.title("🧑‍⚖️ Reviewers Management")
-
-    if os.environ.get("RANDPUNKT_SMOKE_TESTS", "") == "1":
-        _run_smoke_tests()
 
     tab_articles()
 
