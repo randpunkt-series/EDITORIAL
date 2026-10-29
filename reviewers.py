@@ -809,7 +809,6 @@ def publish_to_zenodo_idempotent(articulo_id, submission_data, pdf_bytes):
         headers_json = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
         metadata = build_zenodo_metadata(submission_data)
 
-        # Asegurarnos de que zen sea un diccionario (evita el 'NoneType' object has no attribute 'get')
         zen = submission_data.get("zenodo")
         if not isinstance(zen, dict):
             zen = {}
@@ -844,10 +843,16 @@ def publish_to_zenodo_idempotent(articulo_id, submission_data, pdf_bytes):
                 zen["bucket_url"] = bucket_url
                 
             filename = f"{articulo_id}.pdf"
+            
+            if not _is_valid_pdf(pdf_bytes):
+                return False, "El archivo no es un PDF válido (magic bytes incorrectos).", ""
+
+            files = {'file': (filename, pdf_bytes, 'application/pdf')}
+            
             _zenodo_request("PUT", f"{bucket_url}/{filename}",
-                            headers={"Authorization": f"Bearer {token}",
-                                     "Content-Type": "application/pdf"},
-                            data=pdf_bytes, timeout=300)
+                            headers={"Authorization": f"Bearer {token}"},
+                            data=files, timeout=300)
+            
             zen["file_uploaded"] = True
             submission_data["zenodo"] = zen
             save_submission_json(articulo_id, submission_data)
