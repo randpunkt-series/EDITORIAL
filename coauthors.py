@@ -6,15 +6,7 @@ del coautor. NO gestiona manuscritos, NO publica, NO envía correos.
 
 Fuente de verdad:
   - PDF: JSON de metadata (versions[-1].pdf), leído por SFTP con fallback de rutas.
-  - Registro del coautor: confirmaciones.csv, buscado por TOKEN (no por email).
-
-Robustez:
-  - Lock global para confirmaciones.csv.
-  - Lock por manuscrito para el auto-avance a todos_aprobados.
-  - Escritura atómica (tmp + rename) con backup.
-  - Revocación de token tras aprobar.
-  - Auto-avance solo si estado == en_revision; marca arbitraje_confirmado=1.
-  - Sin except: pass silenciosos.
+  - Registro del coautor: confirmaciones.csv, buscado por EMAIL y ARTÍCULO (no por token).
 """
 from __future__ import annotations
 
@@ -31,7 +23,6 @@ import streamlit as st
 from itsdangerous import URLSafeTimedSerializer, SignatureExpired, BadTimeSignature
 
 import workflow as wf
-
 
 st.set_page_config(
     page_title="RandPunkt — Approval",
@@ -58,21 +49,17 @@ CONF_LOCK_NAME = "__confirmaciones__"
 LOCK_TIMEOUT_SEC = 30
 LOCK_RETRY_SEC = 0.5
 
-
 # ============================================================
 # UTILIDADES
 # ============================================================
 def _log_error(context: str, exc: Exception):
     print(f"[ERROR] {context}: {type(exc).__name__}: {exc}")
 
-
 def _normalize_email(e: str) -> str:
     return (e or "").strip().lower().replace("<", "").replace(">", "")
 
-
 def _normalize_id(s: str) -> str:
     return (s or "").strip()
-
 
 # ============================================================
 # SFTP
@@ -85,16 +72,13 @@ def _sftp_connect():
     sftp = paramiko.SFTPClient.from_transport(transport)
     return transport, sftp
 
-
 def _remote_path(filename):
     rs = st.secrets["remote_server"]
     return f"{rs['dir'].rstrip('/')}/{filename}"
 
-
 def _revista_base() -> str:
     rs = st.secrets["remote_server"]
     return rs.get("revista_dir", rs["dir"].rsplit("/editorial", 1)[0]).rstrip("/")
-
 
 def _ensure_remote_dir(sftp, path: str):
     parts = path.rstrip("/").split("/")
@@ -111,14 +95,12 @@ def _ensure_remote_dir(sftp, path: str):
             except OSError as e:
                 _log_error(f"mkdir {current}", e)
 
-
 # ============================================================
 # LOCKS
 # ============================================================
 def _lock_path(name: str) -> str:
     rs = st.secrets["remote_server"]
     return f"{rs['dir'].rstrip('/')}/.locks/{name}.lock"
-
 
 def _acquire_lock(name: str, timeout: int = LOCK_TIMEOUT_SEC) -> bool:
     try:
@@ -147,7 +129,6 @@ def _acquire_lock(name: str, timeout: int = LOCK_TIMEOUT_SEC) -> bool:
         _log_error(f"acquire lock {name}", e)
         return False
 
-
 def _release_lock(name: str):
     try:
         transport, sftp = _sftp_connect()
@@ -159,7 +140,6 @@ def _release_lock(name: str):
         sftp.close(); transport.close()
     except Exception as e:
         _log_error(f"release lock {name}", e)
-
 
 def _break_stale_lock(name: str, max_age_sec: int = 600):
     try:
@@ -174,7 +154,6 @@ def _break_stale_lock(name: str, max_age_sec: int = 600):
         sftp.close(); transport.close()
     except Exception as e:
         _log_error(f"break stale lock {name}", e)
-
 
 # ============================================================
 # RESOLUCIÓN DE RUTAS CON FALLBACK
@@ -198,7 +177,6 @@ def _candidate_paths(filename: str, kind: str) -> list[str]:
         ]
     return candidates
 
-
 def _resolve_remote_file(sftp, filename: str, kind: str) -> str | None:
     for path in _candidate_paths(filename, kind):
         try:
@@ -207,7 +185,6 @@ def _resolve_remote_file(sftp, filename: str, kind: str) -> str | None:
         except IOError:
             continue
     return None
-
 
 def _download_remote_bytes(filename: str, kind: str) -> bytes | None:
     try:
@@ -223,7 +200,6 @@ def _download_remote_bytes(filename: str, kind: str) -> bytes | None:
     except Exception as e:
         _log_error(f"download {filename}", e)
         return None
-
 
 # ============================================================
 # CSV
@@ -248,7 +224,6 @@ def read_remote_csv(filename, columns):
         _log_error(f"read {filename}", e)
         st.error(f"Error reading {filename}: {e}")
         return pd.DataFrame(columns=columns)
-
 
 def save_remote_csv(filename, df, use_global_lock: bool = False):
     lock_acquired = False
@@ -286,18 +261,14 @@ def save_remote_csv(filename, df, use_global_lock: bool = False):
         if lock_acquired:
             _release_lock(CONF_LOCK_NAME)
 
-
 def read_articles():
     return read_remote_csv(st.secrets["csv"]["articulos_file"], COLS_ARTICULOS)
-
 
 def save_articles(df):
     return save_remote_csv(st.secrets["csv"]["articulos_file"], df)
 
-
 def read_confirmations():
     return read_remote_csv(st.secrets["csv"]["confirmaciones_file"], COLS_CONFIRMACIONES)
-
 
 def save_confirmations(df):
     return save_remote_csv(
@@ -306,10 +277,8 @@ def save_confirmations(df):
         use_global_lock=True,
     )
 
-
 def read_versions():
     return read_remote_csv(st.secrets["csv"]["versiones_file"], COLS_VERSIONES)
-
 
 # ============================================================
 # JSON
@@ -331,7 +300,6 @@ def get_submission(tracking_id):
     except Exception as e:
         _log_error(f"get_submission {tracking_id}", e)
         return None
-
 
 def save_submission_json(tracking_id, data):
     try:
@@ -355,13 +323,11 @@ def save_submission_json(tracking_id, data):
         _log_error(f"save_submission_json {tracking_id}", e)
         return False
 
-
 # ============================================================
 # TOKENS
 # ============================================================
 def get_serializer():
     return URLSafeTimedSerializer(st.secrets["app"]["secret_key"])
-
 
 def validate_token(token):
     try:
@@ -377,16 +343,10 @@ def validate_token(token):
         _log_error("validate_token", e)
         return None, "The link could not be validated."
 
-
 # ============================================================
 # AUTO-AVANCE
 # ============================================================
 def _advance_if_all_approved(article_id: str) -> tuple[bool, str]:
-    """
-    Si todos los coautores aprobaron Y el artículo sigue en 'en_revision',
-    lo pasa a 'todos_aprobados' y marca arbitraje_confirmado=1.
-    Bajo lock por manuscrito (compartido con reviewers.py).
-    """
     _break_stale_lock(article_id)
     lock_ok = _acquire_lock(article_id)
     if not lock_ok:
@@ -416,7 +376,6 @@ def _advance_if_all_approved(article_id: str) -> tuple[bool, str]:
     finally:
         _release_lock(article_id)
 
-
 # ============================================================
 # AUTHOR VIEW
 # ============================================================
@@ -437,25 +396,25 @@ def author_view(token: str):
         st.error("The link is missing required data.")
         return
 
-    # 2) Verificar que el registro existe (búsqueda por TOKEN)
+    # 2) Verificar que el registro existe (Búsqueda por email y artículo)
     df_conf = read_confirmations()
-    row_mask = df_conf["token"] == token
-    row = df_conf[row_mask]
+    
+    # Normalizar las columnas del DataFrame para hacer una búsqueda robusta
+    df_conf["email_norm"] = df_conf["email"].apply(_normalize_email)
+    df_conf["aid_norm"] = df_conf["articulo_id"].apply(_normalize_id)
+    
+    row = df_conf[(df_conf["email_norm"] == payload_email) & (df_conf["aid_norm"] == payload_aid)]
+    
     if row.empty:
         st.error(
-            "Your record was not found. The link may have been regenerated "
-            "by the editor. Please request a new approval link."
+            "Your record was not found. Please check that you are using the correct link "
+            "or contact the editor."
         )
         return
 
     conf_row = row.iloc[0]
     record_aid = _normalize_id(conf_row["articulo_id"])
     record_name = conf_row["nombre"] or payload_name
-
-    # Coherencia token ↔ registro
-    if record_aid != payload_aid:
-        st.error("The link does not match the recorded manuscript. Contact the editor.")
-        return
 
     # 3) Artículo
     df_art = read_articles()
@@ -528,7 +487,11 @@ def author_view(token: str):
 
     # 7) Guardar aprobación bajo lock global
     df_conf2 = read_confirmations()
-    mask2 = df_conf2["token"] == token
+    df_conf2["email_norm"] = df_conf2["email"].apply(_normalize_email)
+    df_conf2["aid_norm"] = df_conf2["articulo_id"].apply(_normalize_id)
+    
+    mask2 = (df_conf2["email_norm"] == payload_email) & (df_conf2["aid_norm"] == payload_aid)
+    
     if not mask2.any():
         st.error("Your record disappeared while approving. Please contact the editor.")
         return
@@ -537,19 +500,22 @@ def author_view(token: str):
     df_conf2.loc[mask2, "fecha_aprobacion"] = datetime.now().isoformat(timespec="seconds")
     df_conf2.loc[mask2, "comentarios"] = comments or ""
 
+    # Limpiamos las columnas temporales antes de guardar
+    df_conf2 = df_conf2.drop(columns=["email_norm", "aid_norm"])
+
     if not save_confirmations(df_conf2):
         st.error("Could not save your approval. Please try again.")
         return
 
-    # 8) Revocar token (solo el de este coautor)
+    # 8) Revocar token (dejar vacío)
     df_conf3 = read_confirmations()
-    mask3 = (
-        (df_conf3["articulo_id"] == record_aid)
-        & (df_conf3["email"].apply(_normalize_email) == payload_email)
-        & (df_conf3["token"] == token)
-    )
+    df_conf3["email_norm"] = df_conf3["email"].apply(_normalize_email)
+    df_conf3["aid_norm"] = df_conf3["articulo_id"].apply(_normalize_id)
+    
+    mask3 = (df_conf3["email_norm"] == payload_email) & (df_conf3["aid_norm"] == payload_aid)
     if mask3.any():
         df_conf3.loc[mask3, "token"] = ""
+        df_conf3 = df_conf3.drop(columns=["email_norm", "aid_norm"])
         save_confirmations(df_conf3)
 
     st.success("Thank you! Your approval has been recorded.")
@@ -570,7 +536,6 @@ def author_view(token: str):
         else:
             st.info(f"ℹ️ {msg}")
 
-
 # ============================================================
 # MAIN
 # ============================================================
@@ -580,7 +545,6 @@ def main():
         author_view(token)
     else:
         st.info("This page is only accessible via a personal approval link.")
-
 
 if __name__ == "__main__":
     main()
