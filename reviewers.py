@@ -816,6 +816,17 @@ def publish_to_zenodo_idempotent(articulo_id, submission_data, pdf_bytes):
 
         dep_id = zen.get("deposition_id")
 
+        # Limpiar depósitos huérfanos si falló un intento anterior
+        if dep_id and not zen.get("published") and not zen.get("file_uploaded"):
+            try:
+                _zenodo_request("DELETE", f"{api_url}/deposit/depositions/{dep_id}", headers=headers_json)
+            except Exception:
+                pass
+            dep_id = None
+            zen = {}
+            submission_data["zenodo"] = zen
+
+        # 1. Crear depósito si no existe
         if not dep_id:
             r = _zenodo_request("POST", f"{api_url}/deposit/depositions",
                                 headers=headers_json, json_data={"metadata": metadata})
@@ -834,6 +845,7 @@ def publish_to_zenodo_idempotent(articulo_id, submission_data, pdf_bytes):
         else:
             bucket_url = zen.get("bucket_url", "")
 
+        # 2. Subir PDF (si no estaba ya subido)
         if not zen.get("file_uploaded"):
             if not bucket_url:
                 r = _zenodo_request("GET", f"{api_url}/deposit/depositions/{dep_id}",
@@ -847,16 +859,23 @@ def publish_to_zenodo_idempotent(articulo_id, submission_data, pdf_bytes):
             if not _is_valid_pdf(pdf_bytes):
                 return False, "El archivo no es un PDF válido (magic bytes incorrectos).", ""
 
-            files = {'file': (filename, pdf_bytes, 'application/pdf')}
+            # CORRECCIÓN DEFINITIVA: BytesIO y sin Content-Type manual
+            pdf_stream = io.BytesIO(pdf_bytes)
+            upload_headers = {"Authorization": f"Bearer {token}"}
             
-            _zenodo_request("PUT", f"{bucket_url}/{filename}",
-                            headers={"Authorization": f"Bearer {token}"},
-                            data=files, timeout=300)
+            r_upload = requests.put(f"{bucket_url}/{filename}", 
+                                    headers=upload_headers, 
+                                    data=pdf_stream, 
+                                    timeout=300)
             
+            if r_upload.status_code >= 400:
+                return False, f"Error subiendo archivo a Zenodo ({r_upload.status_code}): {r_upload.text}", ""
+
             zen["file_uploaded"] = True
             submission_data["zenodo"] = zen
             save_submission_json(articulo_id, submission_data)
 
+        # 3. Publicar (si no estaba publicado)
         if not zen.get("published"):
             r = _zenodo_request("POST",
                                 f"{api_url}/deposit/depositions/{dep_id}/actions/publish",
