@@ -50,6 +50,7 @@ COLS_ARTICULOS = [
     "fecha_creacion", "estado", "isbn", "motivo_retiro", "fecha_retiro",
     "idioma_original", "formato_original", "editor_asignado",
     "arbitraje_confirmado",
+    "volume", "issue", "published_at",
 ]
 COLS_VERSIONES = ["articulo_id", "fecha", "ruta_pdf", "nombre_archivo", "notas"]
 COLS_CONFIRMACIONES = [
@@ -700,6 +701,7 @@ def import_from_revista():
                 "idioma_original": data.get("original_language", ""),
                 "formato_original": data.get("original_format", ""),
                 "editor_asignado": "", "arbitraje_confirmado": "0",
+                "volume": "", "issue": "", "published_at": "",
             })
             if pdf_name:
                 new_ver_rows.append({
@@ -785,7 +787,9 @@ def build_zenodo_metadata(submission):
         "Original Research Article": "article", "Research Article": "article",
         "Book": "book", "Book Chapter": "section",
     }
-    pub_date = datetime.now().strftime("%Y-%m-%d")
+    pub_date = submission.get("published_at") or datetime.now().strftime("%Y-%m-%d")
+    if submission.get("volume") and submission.get("issue"):
+        keywords.append(f"Volume {submission['volume']}, Issue {submission['issue']}")
     community = st.secrets.get("zenodo", {}).get("community", "randpunkt-journal")
     return {
         "title": submission.get("titulo", "Untitled"),
@@ -801,12 +805,26 @@ def build_zenodo_metadata(submission):
     }
 
 
-def publish_to_zenodo_idempotent(articulo_id, submission_data, pdf_bytes):
+def publish_to_zenodo_idempotent(articulo_id, submission_data, pdf_bytes, volume=None, issue=None, publication_date=None):
     try:
         api_url, token = _zenodo_config()
         if not token:
             return False, "Zenodo token no configurado", ""
         headers_json = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        # Inyectar issue/volume/fecha real antes de construir metadatos de Zenodo
+        if volume is not None:
+            submission_data["volume"] = volume
+        if issue is not None:
+            submission_data["issue"] = issue
+        if publication_date is not None:
+            submission_data["published_at"] = publication_date
+            im = submission_data.get("issue_metadata") or {}
+            im["volume"] = submission_data.get("volume", im.get("volume"))
+            im["issue"] = submission_data.get("issue", im.get("issue"))
+            im["first_publication_date"] = publication_date
+            if im.get("volume") and im.get("issue"):
+                im["label"] = f"Volume {im['volume']}, Issue {im['issue']}"
+            submission_data["issue_metadata"] = im
         metadata = build_zenodo_metadata(submission_data)
 
         zen = submission_data.get("zenodo")
@@ -927,6 +945,13 @@ def _advance_if_all_approved(articulo_id: str) -> tuple[bool, str]:
         df_art.loc[mask, "arbitraje_confirmado"] = "1"
         
         if save_articles(df_art):
+            try:
+                _sub = get_submission(articulo_id)
+                if _sub and not _sub.get("accepted_at"):
+                    _sub["accepted_at"] = datetime.now().isoformat(timespec="seconds")
+                    save_submission_json(articulo_id, _sub)
+            except Exception as _e:
+                _log_error("set accepted_at", _e)
             append_log("AUTO-ADV", articulo_id, "Todos los coautores aprobaron (sincronizado desde el panel).")
             return True, "✅ Todos los coautores aprobaron. Estado actualizado a 'todos_aprobados'."
             
@@ -959,6 +984,49 @@ def _revalidate_permissions() -> bool:
 # ============================================================
 # TAB: MANUSCRIPTS
 # ============================================================
+def _backfill_issue_fields():
+    """Asigna Vol 1 / Issue 1 / fecha de publicación a artículos ya publicados sin esos campos."""
+    df_full = read_articles()
+    if df_full.empty:
+        st.info("No hay artículos para backfill.")
+        return
+    mask = (df_full["estado"] == wf.STATE_PUBLISHED) & (
+        (df_full["volume"].isna()) | (df_full["volume"].astype(str).str.strip() == "")
+    )
+    target = df_full[mask]
+    if target.empty:
+        st.info("Todos los publicados ya tienen volume/issue.")
+        return
+    st.write(f"Artículos a backfill: {len(target)}")
+    st.dataframe(target[["articulo_id", "titulo"]], use_container_width=True)
+    _vol_bf = st.number_input("Volume (backfill)", min_value=1, value=1, key="bf_vol")
+    _iss_bf = st.number_input("Issue (backfill)", min_value=1, value=1, key="bf_iss")
+    _date_bf = st.date_input("Publication date (backfill)", value=datetime.now().date(), key="bf_date")
+    if st.button("Confirm backfill", key="bf_confirm"):
+        n = 0
+        for _tid in target["articulo_id"].tolist():
+            sub = get_submission(_tid)
+            if not sub:
+                continue
+            im = sub.get("issue_metadata") or {}
+            im["volume"] = int(_vol_bf)
+            im["issue"] = int(_iss_bf)
+            im["label"] = f"Volume {_vol_bf}, Issue {_iss_bf}"
+            im["first_publication_date"] = _date_bf.isoformat()
+            sub["issue_metadata"] = im
+            sub["volume"] = int(_vol_bf)
+            sub["issue"] = int(_iss_bf)
+            sub["published_at"] = _date_bf.isoformat()
+            if save_submission_json(_tid, sub):
+                df_full.loc[df_full["articulo_id"] == _tid, "volume"] = str(_vol_bf)
+                df_full.loc[df_full["articulo_id"] == _tid, "issue"] = str(_iss_bf)
+                df_full.loc[df_full["articulo_id"] == _tid, "published_at"] = _date_bf.isoformat()
+                n += 1
+        save_articles(df_full)
+        st.success(f"✅ {n} artículo(s) actualizado(s).")
+        st.rerun()
+
+
 def tab_articles():
     st.subheader("📚 Manuscripts and books")
 
@@ -975,7 +1043,7 @@ def tab_articles():
     is_chief = (user_level == 0)
 
     if is_chief:
-        c1, c2 = st.columns([3, 1])
+        c1, c2, c3 = st.columns([2, 1, 1])
         with c1:
             st.caption("Import submissions from the journal.")
         with c2:
@@ -990,6 +1058,9 @@ def tab_articles():
                         st.error(e)
                 else:
                     st.info("No new manuscripts to import.")
+        with c3:
+            if st.button("📦 Backfill Vol 1 / Issue 1", use_container_width=True):
+                _backfill_issue_fields()
 
     df_art_all = read_articles()
     if df_art_all.empty:
@@ -1309,6 +1380,13 @@ def tab_articles():
                                     df_full = read_articles()
                                     res = wf.force_advance_to_todos_aprobados(df_full, aid)
                                     if res.ok and save_articles(df_full):
+                                        try:
+                                            _sub = get_submission(aid)
+                                            if _sub and not _sub.get("accepted_at"):
+                                                _sub["accepted_at"] = datetime.now().isoformat(timespec="seconds")
+                                                save_submission_json(aid, _sub)
+                                        except Exception as _e:
+                                            _log_error("set accepted_at (force)", _e)
                                         append_log("FORCE-ADV", aid, res.message)
                                         st.success(res.message)
                                         st.rerun()
@@ -1328,6 +1406,22 @@ def tab_articles():
                         st.caption(f"Environment: **{env}**")
                         if not has_creds:
                             st.warning("No Zenodo credentials for this environment.")
+                        # --- Issue / Volume / Publication date ---
+                        _im = (sub or {}).get("issue_metadata") or {}
+                        _def_vol = int(_im.get("volume") or st.secrets.get("issue", {}).get("volume", 1))
+                        _def_iss = int(_im.get("issue") or st.secrets.get("issue", {}).get("issue", 1))
+                        _def_date_str = (sub or {}).get("published_at") or _im.get("first_publication_date") or datetime.now().strftime("%Y-%m-%d")
+                        try:
+                            _def_date = datetime.strptime(_def_date_str, "%Y-%m-%d").date()
+                        except Exception:
+                            _def_date = datetime.now().date()
+                        _c1, _c2, _c3 = st.columns(3)
+                        with _c1:
+                            _vol = st.number_input("Volume", min_value=1, value=_def_vol, key=f"vol_{aid}")
+                        with _c2:
+                            _iss = st.number_input("Issue", min_value=1, value=_def_iss, key=f"iss_{aid}")
+                        with _c3:
+                            _pdate = st.date_input("Publication date", value=_def_date, key=f"pdate_{aid}")
                         if st.button("🚀 PUBLISH to Zenodo", key=f"pub_{aid}",
                                      use_container_width=True, type="primary",
                                      disabled=not has_creds):
@@ -1341,13 +1435,20 @@ def tab_articles():
                                 if not pdf_bytes:
                                     st.error("Cannot publish: PDF of the latest version not found.")
                                 else:
-                                    ok, doi_or_error, url = publish_to_zenodo_idempotent(aid, sub, pdf_bytes)
+                                    ok, doi_or_error, url = publish_to_zenodo_idempotent(
+                                            aid, sub, pdf_bytes,
+                                            volume=int(_vol), issue=int(_iss),
+                                            publication_date=_pdate.isoformat(),
+                                        )
                                     if ok:
                                         sub["status"] = "published"
                                         save_submission_json(aid, sub)
 
                                         df_full = read_articles()
                                         df_full.loc[df_full["articulo_id"] == aid, "estado"] = wf.STATE_PUBLISHED
+                                        df_full.loc[df_full["articulo_id"] == aid, "volume"] = str(_vol)
+                                        df_full.loc[df_full["articulo_id"] == aid, "issue"] = str(_iss)
+                                        df_full.loc[df_full["articulo_id"] == aid, "published_at"] = _pdate.isoformat()
                                         save_articles(df_full)
 
                                         append_log("PUBLISH", aid, f"{env} DOI {doi_or_error}")

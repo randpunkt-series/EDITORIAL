@@ -35,6 +35,7 @@ COLS_ARTICULOS = [
     "fecha_creacion", "estado", "isbn", "motivo_retiro", "fecha_retiro",
     "idioma_original", "formato_original", "editor_asignado",
     "arbitraje_confirmado",
+    "volume", "issue", "published_at",
 ]
 COLS_CONFIRMACIONES = [
     "articulo_id", "nombre", "email", "token",
@@ -397,6 +398,10 @@ def author_view(token: str):
     st.write(f"Dear **{record_name}**, you have been invited to approve:")
     st.markdown(f"### {art['titulo']}")
     st.caption(f"Reference: {record_aid}")
+    _vol = art.get("volume")
+    _iss = art.get("issue")
+    if _vol and _iss:
+        st.caption(f"Volume {_vol}, Issue {_iss}")
 
     # 4) PDF de la última versión (con fallback)
     st.markdown("### Manuscript File")

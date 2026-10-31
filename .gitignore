@@ -19,3 +19,4 @@ nohup.out
 
 # Datos generados
 uploads/
+*.bak*
