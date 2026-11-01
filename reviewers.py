@@ -131,7 +131,6 @@ def _cleanup_old_backups(sftp, base_name: str, keep_days: int = 30):
 # ============================================================
 def _lock_path(name: str) -> str:
     rs = st.secrets["remote_server"]
-    # Limpieza extra de barras para evitar errores de ruta
     base = rs['dir'].rstrip('/')
     return f"{base}/.locks/{name}.lock"
 
@@ -165,7 +164,6 @@ def _acquire_lock(name: str, timeout: int = LOCK_TIMEOUT_SEC) -> str | None:
         return None
 
 def _release_lock(name: str) -> bool:
-    """Intenta borrar el lock. Devuelve True si lo logra o si ya no existía."""
     try:
         transport, sftp = _sftp_connect()
         path = _lock_path(name)
@@ -173,7 +171,7 @@ def _release_lock(name: str) -> bool:
             sftp.remove(path)
             success = True
         except IOError:
-            success = False  # El archivo no existía
+            success = False
         sftp.close(); transport.close()
         return success
     except Exception as e:
@@ -216,7 +214,6 @@ def _candidate_paths(filename: str, kind: str) -> list[str]:
         ]
     return candidates
 
-
 def _resolve_remote_file(sftp, filename: str, kind: str) -> str | None:
     for path in _candidate_paths(filename, kind):
         try:
@@ -225,7 +222,6 @@ def _resolve_remote_file(sftp, filename: str, kind: str) -> str | None:
         except IOError:
             continue
     return None
-
 
 def _download_remote_bytes(filename: str, kind: str) -> bytes | None:
     try:
@@ -242,13 +238,11 @@ def _download_remote_bytes(filename: str, kind: str) -> bytes | None:
         _log_error(f"download {filename}", e)
         return None
 
-
 # ============================================================
 # VALIDACIÓN DE ARCHIVOS
 # ============================================================
 def _is_valid_pdf(data: bytes) -> bool:
     return len(data) > 4 and data[:4] == b"%PDF"
-
 
 def _is_valid_zip(data: bytes) -> bool:
     if len(data) < 4:
@@ -260,7 +254,6 @@ def _is_valid_zip(data: bytes) -> bool:
             return z.testzip() is None
     except Exception:
         return False
-
 
 def _validate_upload(pdf_bytes: bytes, zip_bytes: bytes) -> tuple[bool, str]:
     if len(pdf_bytes) == 0:
@@ -277,9 +270,8 @@ def _validate_upload(pdf_bytes: bytes, zip_bytes: bytes) -> tuple[bool, str]:
         return False, "El archivo no es un ZIP válido."
     return True, ""
 
-
 # ============================================================
-# CSV (todo en servidor remoto, escritura atómica)
+# CSV
 # ============================================================
 def _read_csv(filename, columns):
     try:
@@ -301,7 +293,6 @@ def _read_csv(filename, columns):
         _log_error(f"read {filename}", e)
         st.error(f"Error reading {filename}: {e}")
         return pd.DataFrame(columns=columns)
-
 
 def _save_csv(filename, df, use_global_lock: bool = False):
     try:
@@ -331,22 +322,14 @@ def _save_csv(filename, df, use_global_lock: bool = False):
         st.error(f"Error saving {filename}: {e}")
         return False
 
-
 def read_articles():       return _read_csv(st.secrets["csv"]["articulos_file"], COLS_ARTICULOS)
 def save_articles(df):     return _save_csv(st.secrets["csv"]["articulos_file"], df)
 def read_versions():       return _read_csv(st.secrets["csv"]["versiones_file"], COLS_VERSIONES)
 def save_versions(df):     return _save_csv(st.secrets["csv"]["versiones_file"], df)
 def read_confirmations():  return _read_csv(st.secrets["csv"]["confirmaciones_file"], COLS_CONFIRMACIONES)
 
-
 def save_confirmations(df):
-    """Escritura de confirmaciones.csv sin lock (evita bloqueos huérfanos)."""
-    return _save_csv(
-        st.secrets["csv"]["confirmaciones_file"],
-        df,
-        use_global_lock=False,
-    )
-
+    return _save_csv(st.secrets["csv"]["confirmaciones_file"], df, use_global_lock=False)
 
 def read_coauthors():
     try:
@@ -373,10 +356,8 @@ def read_coauthors():
         st.error(f"Error reading coauthors: {e}")
         return pd.DataFrame(columns=COLS_COAUTORES)
 
-
 def save_coauthors(df): return _save_csv(st.secrets["csv"]["coautores_file"], df)
 def read_editores():    return _read_csv(st.secrets["csv"]["editores_file"], ["login", "password", "level", "email"])
-
 
 def get_submission(tracking_id):
     try:
@@ -395,7 +376,6 @@ def get_submission(tracking_id):
     except Exception as e:
         _log_error(f"get_submission {tracking_id}", e)
         return None
-
 
 def save_submission_json(tracking_id, data):
     try:
@@ -440,10 +420,8 @@ def append_log(action, articulo_id, detail=""):
     except Exception as e:
         print(f"[LOG] {e}")
 
-
 def get_serializer():
     return URLSafeTimedSerializer(st.secrets["app"]["secret_key"])
-
 
 def generate_token(email, article_id, name):
     return get_serializer().dumps(
@@ -451,13 +429,11 @@ def generate_token(email, article_id, name):
         salt="aprobacion-autor",
     )
 
-
 def validate_token(token: str) -> dict | None:
     try:
         return get_serializer().loads(token, salt="aprobacion-autor", max_age=TOKEN_MAX_AGE_SEC)
     except (BadSignature, SignatureExpired):
         return None
-
 
 def revoke_token(articulo_id: str, email: str):
     df = read_confirmations()
@@ -466,7 +442,6 @@ def revoke_token(articulo_id: str, email: str):
         df.loc[mask, "token"] = ""
         save_confirmations(df)
         append_log("REVOKE-TOKEN", articulo_id, email)
-
 
 # ============================================================
 # EMAIL
@@ -480,7 +455,6 @@ def _smtp_config():
         "password": email_conf.get("sender_password", ""),
         "name":     email_conf.get("sender_name", "RandPunkt Journal"),
     }
-
 
 def _send_email(to_email: str, subject: str, body: str,
                 attachments: list[tuple[str, bytes]] | None = None) -> bool:
@@ -516,7 +490,6 @@ def _send_email(to_email: str, subject: str, body: str,
         _log_error(f"send_email {to_email}", e)
         return False
 
-
 def enviar_correo_asignacion(email_revisor, nombre_revisor, articulo_id, titulo):
     return _send_email(
         email_revisor,
@@ -525,7 +498,6 @@ def enviar_correo_asignacion(email_revisor, nombre_revisor, articulo_id, titulo)
         f"Se te ha asignado el manuscrito {articulo_id}: {titulo}\n\n"
         f"Ingresa al panel de revisores para gestionarlo.\n\nRandPunkt Journal",
     )
-
 
 def enviar_correo_coautor(email_coautor, nombre_coautor, articulo_id,
                           titulo, link, pdf_bytes: bytes | None = None,
@@ -547,7 +519,6 @@ def enviar_correo_coautor(email_coautor, nombre_coautor, articulo_id,
         attachments=attachments,
     )
 
-
 # ============================================================
 # UPLOAD VERSION
 # ============================================================
@@ -556,7 +527,7 @@ def upload_version(articulo_id, pdf_bytes, zip_bytes, pdf_name, zip_name, notas)
     if not ok:
         return False, err
 
-    _break_stale_lock(articulo_id) # Limpieza proactiva
+    _break_stale_lock(articulo_id)
     lock = _acquire_lock(articulo_id)
     if not lock:
         return False, "El manuscrito está bloqueado por otro editor. Reintenta en unos segundos."
@@ -616,7 +587,6 @@ def upload_version(articulo_id, pdf_bytes, zip_bytes, pdf_name, zip_name, notas)
         return False, str(e)
     finally:
         _release_lock(articulo_id)
-
 
 # ============================================================
 # IMPORT
@@ -706,9 +676,8 @@ def import_from_revista():
         _log_error("import_from_revista", e)
         return 0, [f"Connection error: {e}"]
 
-
 # ============================================================
-# ZENODO (idempotente, solo reintenta 5xx/red)
+# ZENODO
 # ============================================================
 def _zenodo_config():
     zen = st.secrets.get("zenodo", {})
@@ -717,7 +686,6 @@ def _zenodo_config():
     if zen.get("sandbox", False):
         return zen.get("sandbox_api", "https://sandbox.zenodo.org/api"), zen.get("sandbox_token", "")
     return zen.get("api", "https://zenodo.org/api"), zen.get("token", "")
-
 
 def _zenodo_request(method, url, *, headers=None, json_data=None, data=None,
                     timeout=30, max_retries=3):
@@ -737,7 +705,6 @@ def _zenodo_request(method, url, *, headers=None, json_data=None, data=None,
             last_exc = e
             time.sleep(2 ** attempt)
     raise last_exc
-
 
 def build_zenodo_metadata(submission):
     ca = submission.get("corresponding_author", {}) or {}
@@ -784,14 +751,12 @@ def build_zenodo_metadata(submission):
         "communities": [{"identifier": community}],
     }
 
-
 def publish_to_zenodo_idempotent(articulo_id, submission_data, pdf_bytes, volume=None, issue=None, publication_date=None):
     try:
         api_url, token = _zenodo_config()
         if not token:
             return False, "Zenodo token no configurado", ""
         headers_json = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-        # Inyectar issue/volume/fecha real antes de construir metadatos de Zenodo
         if volume is not None:
             submission_data["volume"] = volume
         if issue is not None:
@@ -814,7 +779,6 @@ def publish_to_zenodo_idempotent(articulo_id, submission_data, pdf_bytes, volume
 
         dep_id = zen.get("deposition_id")
 
-        # Limpiar depósitos huérfanos si falló un intento anterior
         if dep_id and not zen.get("published") and not zen.get("file_uploaded"):
             try:
                 _zenodo_request("DELETE", f"{api_url}/deposit/depositions/{dep_id}", headers=headers_json)
@@ -824,15 +788,12 @@ def publish_to_zenodo_idempotent(articulo_id, submission_data, pdf_bytes, volume
             zen = {}
             submission_data["zenodo"] = zen
 
-        # 1. Crear depósito si no existe
         if not dep_id:
             r = _zenodo_request("POST", f"{api_url}/deposit/depositions",
                                 headers=headers_json, json_data={"metadata": metadata})
             dep = r.json()
-
             if "id" not in dep or "links" not in dep:
                 return False, f"Respuesta inesperada de Zenodo: {str(dep)[:200]}", ""
-
             dep_id = dep["id"]
             bucket_url = dep["links"]["bucket"]
             zen["deposition_id"] = dep_id
@@ -843,7 +804,6 @@ def publish_to_zenodo_idempotent(articulo_id, submission_data, pdf_bytes, volume
         else:
             bucket_url = zen.get("bucket_url", "")
 
-        # 2. Subir PDF (si no estaba ya subido)
         if not zen.get("file_uploaded"):
             if not bucket_url:
                 r = _zenodo_request("GET", f"{api_url}/deposit/depositions/{dep_id}",
@@ -851,37 +811,23 @@ def publish_to_zenodo_idempotent(articulo_id, submission_data, pdf_bytes, volume
                 dep_info = r.json()
                 bucket_url = dep_info.get("links", {}).get("bucket", "")
                 zen["bucket_url"] = bucket_url
-
             filename = f"{articulo_id}.pdf"
-
             if not _is_valid_pdf(pdf_bytes):
-                return False, "El archivo no es un PDF válido (magic bytes incorrectos).", ""
-
+                return False, "El archivo no es un PDF válido.", ""
             pdf_stream = io.BytesIO(pdf_bytes)
             upload_headers = {"Authorization": f"Bearer {token}"}
-
-            r_upload = requests.put(f"{bucket_url}/{filename}",
-                                    headers=upload_headers,
-                                    data=pdf_stream,
-                                    timeout=300)
-
+            r_upload = requests.put(f"{bucket_url}/{filename}", headers=upload_headers, data=pdf_stream, timeout=300)
             if r_upload.status_code >= 400:
                 return False, f"Error subiendo archivo a Zenodo ({r_upload.status_code}): {r_upload.text}", ""
-
             zen["file_uploaded"] = True
             submission_data["zenodo"] = zen
             save_submission_json(articulo_id, submission_data)
 
-        # 3. Publicar (si no estaba publicado)
         if not zen.get("published"):
-            r = _zenodo_request("POST",
-                                f"{api_url}/deposit/depositions/{dep_id}/actions/publish",
-                                headers=headers_json)
+            r = _zenodo_request("POST", f"{api_url}/deposit/depositions/{dep_id}/actions/publish", headers=headers_json)
             published = r.json()
-
             if "doi" not in published and "links" not in published:
                 return False, f"Error al publicar en Zenodo: {str(published)[:200]}", ""
-
             zen["doi"] = published.get("doi", "")
             zen["url"] = published.get("links", {}).get("record_html", "")
             zen["published"] = True
@@ -895,7 +841,7 @@ def publish_to_zenodo_idempotent(articulo_id, submission_data, pdf_bytes, volume
         return False, str(e), ""
 
 # ============================================================
-# AVANCE AUTOMÁTICO A "todos_aprobados" (FORZADO/SINCRONIZADO)
+# AVANCE AUTOMÁTICO A "todos_aprobados"
 # ============================================================
 def _advance_if_all_approved(articulo_id: str) -> tuple[bool, str]:
     df_conf = read_confirmations()
@@ -930,11 +876,10 @@ def _advance_if_all_approved(articulo_id: str) -> tuple[bool, str]:
                     save_submission_json(articulo_id, _sub)
             except Exception as _e:
                 _log_error("set accepted_at", _e)
-            append_log("AUTO-ADV", articulo_id, "Todos los coautores aprobaron (sincronizado desde el panel).")
-            return True, "✅ Todos los coautores aprobaron. Estado actualizado a 'todos_aprobados'."
+            append_log("AUTO-ADV", articulo_id, "Todos los coautores aprobaron.")
+            return True, "✅ Todos los coautores aprobaron."
 
-    return False, "No se pudo actualizar el estado (el artículo ya no está en revisión)."
-
+    return False, "No se pudo actualizar el estado."
 
 # ============================================================
 # REVALIDACIÓN DE PERMISOS
@@ -947,7 +892,7 @@ def _revalidate_permissions() -> bool:
     df_ed = read_editores()
     row = df_ed[df_ed["login"] == login]
     if row.empty:
-        st.error("Tu cuenta ya no existe en el sistema. Cerrando sesión.")
+        st.error("Tu cuenta ya no existe. Cerrando sesión.")
         for k in ["editor_login", "editor_level", "editor_email", "authenticated"]:
             st.session_state.pop(k, None)
         return False
@@ -957,7 +902,6 @@ def _revalidate_permissions() -> bool:
         st.session_state["editor_level"] = real_level
     st.session_state["editor_email"] = row.iloc[0].get("email", "")
     return True
-
 
 # ============================================================
 # TAB: MANUSCRIPTS
@@ -1003,7 +947,6 @@ def _backfill_issue_fields():
         save_articles(df_full)
         st.success(f"✅ {n} artículo(s) actualizado(s).")
         st.rerun()
-
 
 def tab_articles():
     st.subheader("📚 Manuscripts and books")
@@ -1197,8 +1140,6 @@ def tab_articles():
                                     }])], ignore_index=True)
                                     ok += 1
                             save_confirmations(df_conf)
-                            # Ya no llamamos a _advance_if_all_approved aquí para evitar locks
-                            # en medio del envío de correos. Se hará al recargar la página.
                             st.success(f"✅ Sent {ok} invitation(s) with PDF attached.")
                             st.rerun()
 
@@ -1352,40 +1293,25 @@ def tab_articles():
                                      key=f"force_adv_{aid}",
                                      use_container_width=True, type="primary"):
 
-                            # 1. Intentar adquirir el lock normalmente
-                            lock = _acquire_lock(aid, timeout=2)
-
-                            # 2. Si falla, forzar el borrado del lock
-                            if not lock:
-                                success = _release_lock(aid) # Intento de borrado a la fuerza
-                                if not success:
-                                    st.error("El servidor SFTP denegó el borrado del archivo .lock. Revisa los permisos de la carpeta .locks en tu servidor.")
+                            # CORRECCIÓN: El Jefe salta el sistema de locks por completo
+                            try:
+                                df_full = read_articles()
+                                res = wf.force_advance_to_todos_aprobados(df_full, aid)
+                                if res.ok and save_articles(df_full):
+                                    try:
+                                        _sub = get_submission(aid)
+                                        if _sub and not _sub.get("accepted_at"):
+                                            _sub["accepted_at"] = datetime.now().isoformat(timespec="seconds")
+                                            save_submission_json(aid, _sub)
+                                    except Exception as _e:
+                                        _log_error("set accepted_at (force)", _e)
+                                    append_log("FORCE-ADV", aid, res.message)
+                                    st.success(res.message)
+                                    st.rerun()
                                 else:
-                                    lock = _acquire_lock(aid, timeout=2) # Reintentar
-
-                            if not lock:
-                                st.error("Manuscrito bloqueado. Si estás seguro de que nadie más lo está editando, borra el archivo .lock manualmente.")
-                            else:
-                                try:
-                                    df_full = read_articles()
-                                    res = wf.force_advance_to_todos_aprobados(df_full, aid)
-                                    if res.ok and save_articles(df_full):
-                                        try:
-                                            _sub = get_submission(aid)
-                                            if _sub and not _sub.get("accepted_at"):
-                                                _sub["accepted_at"] = datetime.now().isoformat(timespec="seconds")
-                                                save_submission_json(aid, _sub)
-                                        except Exception as _e:
-                                            _log_error("set accepted_at (force)", _e)
-                                        append_log("FORCE-ADV", aid, res.message)
-                                        st.success(res.message)
-                                        st.rerun()
-                                    else:
-                                        st.error(res.message)
-                                except Exception as e:
-                                    st.error(f"Error interno: {e}")
-                                finally:
-                                    _release_lock(aid) # Liberación garantizada
+                                    st.error(res.message)
+                            except Exception as e:
+                                st.error(f"Error al forzar el avance: {e}")
 
                 elif estado == wf.STATE_TODOS_APROBADOS:
                     st.success("🎉 Ready for publication.")
