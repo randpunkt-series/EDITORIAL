@@ -68,9 +68,9 @@ MAX_PDF_BYTES = 50 * 1024 * 1024   # 50 MB
 MAX_ZIP_BYTES = 100 * 1024 * 1024  # 100 MB
 MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024  # 20 MB (límite SMTP prudente)
 
-LOCK_TIMEOUT_SEC = 30
+LOCK_TIMEOUT_SEC = 5
 LOCK_RETRY_SEC = 0.5
-LOCK_MAX_AGE = 120  # Segundos antes de considerar un lock como huérfano
+LOCK_MAX_AGE = 10  # Reducido de 120 a 10 segundos para evitar bloqueos huérfanos
 TOKEN_MAX_AGE_SEC = 30 * 86400  # 30 días
 
 
@@ -199,7 +199,7 @@ def _release_lock(name: str):
         _log_error(f"release lock {name}", e)
 
 
-def _break_stale_lock(name: str, max_age_sec: int = 600):
+def _break_stale_lock(name: str, max_age_sec: int = LOCK_MAX_AGE):
     try:
         transport, sftp = _sftp_connect()
         path = _lock_path(name)
@@ -212,7 +212,6 @@ def _break_stale_lock(name: str, max_age_sec: int = 600):
         sftp.close(); transport.close()
     except Exception as e:
         _log_error(f"break stale lock {name}", e)
-
 
 # ============================================================
 # RESOLUCIÓN DE RUTAS CON FALLBACK
@@ -486,8 +485,7 @@ def revoke_token(articulo_id: str, email: str):
     if mask.any():
         df.loc[mask, "token"] = ""
         save_confirmations(df)
-        append_log("REVOKE-TOKEN", articulo_id, email)
-
+        append_log("REVOKE-TOKEN", articulo_id, email)        
 
 # ============================================================
 # EMAIL
@@ -577,6 +575,7 @@ def upload_version(articulo_id, pdf_bytes, zip_bytes, pdf_name, zip_name, notas)
     if not ok:
         return False, err
 
+    _break_stale_lock(articulo_id) # Limpieza proactiva
     lock = _acquire_lock(articulo_id)
     if not lock:
         return False, "El manuscrito está bloqueado por otro editor. Reintenta en unos segundos."
@@ -915,17 +914,16 @@ def publish_to_zenodo_idempotent(articulo_id, submission_data, pdf_bytes, volume
         _log_error(f"publish_to_zenodo {articulo_id}", e)
         return False, str(e), ""
 
-
 # ============================================================
 # AVANCE AUTOMÁTICO A "todos_aprobados" (FORZADO/SINCRONIZADO)
 # ============================================================
 def _advance_if_all_approved(articulo_id: str) -> tuple[bool, str]:
     df_conf = read_confirmations()
     conf = df_conf[df_conf["articulo_id"] == articulo_id]
-    
+
     if conf.empty:
         return False, "Sin coautores invitados."
-        
+
     pending = conf[conf["aprobado"] != "1"]
     if not pending.empty:
         return False, f"Pendientes: {len(pending)} coautor(es)."
@@ -934,16 +932,16 @@ def _advance_if_all_approved(articulo_id: str) -> tuple[bool, str]:
     mask = df_art["articulo_id"] == articulo_id
     if not mask.any():
         return False, "Artículo no encontrado."
-        
+
     estado_actual = df_art.loc[mask, "estado"].iloc[0]
-    
+
     if estado_actual == wf.STATE_TODOS_APROBADOS:
         return False, "Ya está en 'todos_aprobados'."
-        
+
     if estado_actual == wf.STATE_EN_REVISION:
         df_art.loc[mask, "estado"] = wf.STATE_TODOS_APROBADOS
         df_art.loc[mask, "arbitraje_confirmado"] = "1"
-        
+
         if save_articles(df_art):
             try:
                 _sub = get_submission(articulo_id)
@@ -954,7 +952,7 @@ def _advance_if_all_approved(articulo_id: str) -> tuple[bool, str]:
                 _log_error("set accepted_at", _e)
             append_log("AUTO-ADV", articulo_id, "Todos los coautores aprobaron (sincronizado desde el panel).")
             return True, "✅ Todos los coautores aprobaron. Estado actualizado a 'todos_aprobados'."
-            
+
     return False, "No se pudo actualizar el estado (el artículo ya no está en revisión)."
 
 
@@ -1219,7 +1217,8 @@ def tab_articles():
                                     }])], ignore_index=True)
                                     ok += 1
                             save_confirmations(df_conf)
-                            _advance_if_all_approved(aid)
+                            # Ya no llamamos a _advance_if_all_approved aquí para evitar locks
+                            # en medio del envío de correos. Se hará al recargar la página.
                             st.success(f"✅ Sent {ok} invitation(s) with PDF attached.")
                             st.rerun()
 
@@ -1372,9 +1371,12 @@ def tab_articles():
                         if st.button("🚀 Advance to 'todos_aprobados' (force)",
                                      key=f"force_adv_{aid}",
                                      use_container_width=True, type="primary"):
-                            lock = _acquire_lock(aid)
+                            # CORRECCIÓN CLAVE: forzar borrado del lock si tiene >5 seg de antigüedad
+                            _break_stale_lock(aid, max_age_sec=5)
+
+                            lock = _acquire_lock(aid, timeout=5)
                             if not lock:
-                                st.error("Manuscrito bloqueado por otro editor.")
+                                st.error("Manuscrito bloqueado. Si estás seguro de que nadie más lo está editando, espera 5 segundos y vuelve a intentarlo.")
                             else:
                                 try:
                                     df_full = read_articles()
@@ -1392,8 +1394,10 @@ def tab_articles():
                                         st.rerun()
                                     else:
                                         st.error(res.message)
+                                except Exception as e:
+                                    st.error(f"Error interno: {e}")
                                 finally:
-                                    _release_lock(aid)
+                                    _release_lock(aid) # Liberación garantizada
 
                 elif estado == wf.STATE_TODOS_APROBADOS:
                     st.success("🎉 Ready for publication.")
