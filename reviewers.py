@@ -1,14 +1,5 @@
 """
 RandPunkt — Editorial panel (reviewers.py) — Versión robusta final.
-
-Modelo de permisos:
-  - Associate (Level 1): gestiona coautores, sube versiones, descarga originales.
-  - Chief (Level 0): asigna/reasigna editores y publica en Zenodo.
-
-Modelo de estados:
-  en_revision  →  todos_aprobados  →  published
-       ↘               ↘
-              retirado
 """
 from __future__ import annotations
 
@@ -49,8 +40,7 @@ COLS_ARTICULOS = [
     "articulo_id", "tipo", "titulo", "ruta_pdf", "ruta_cover",
     "fecha_creacion", "estado", "isbn", "motivo_retiro", "fecha_retiro",
     "idioma_original", "formato_original", "editor_asignado",
-    "arbitraje_confirmado",
-    "volume", "issue", "published_at",
+    "arbitraje_confirmado", "volume", "issue", "published_at",
 ]
 COLS_VERSIONES = ["articulo_id", "fecha", "ruta_pdf", "nombre_archivo", "notas"]
 COLS_CONFIRMACIONES = [
@@ -66,13 +56,12 @@ MOTIVOS_RETIRO = [
 
 MAX_PDF_BYTES = 50 * 1024 * 1024   # 50 MB
 MAX_ZIP_BYTES = 100 * 1024 * 1024  # 100 MB
-MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024  # 20 MB (límite SMTP prudente)
+MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024  # 20 MB
 
 LOCK_TIMEOUT_SEC = 5
 LOCK_RETRY_SEC = 0.5
-LOCK_MAX_AGE = 10  # Reducido de 120 a 10 segundos para evitar bloqueos huérfanos
-TOKEN_MAX_AGE_SEC = 30 * 86400  # 30 días
-
+LOCK_MAX_AGE = 10
+TOKEN_MAX_AGE_SEC = 30 * 86400
 
 # ============================================================
 # LOG DE ERRORES
@@ -85,7 +74,6 @@ def _log_error(context: str, exc: Exception):
     except Exception:
         pass
 
-
 # ============================================================
 # SFTP
 # ============================================================
@@ -97,16 +85,13 @@ def _sftp_connect():
     sftp = paramiko.SFTPClient.from_transport(transport)
     return transport, sftp
 
-
 def _remote_path(filename: str) -> str:
     rs = st.secrets["remote_server"]
     return f"{rs['dir'].rstrip('/')}/{filename}"
 
-
 def _revista_base() -> str:
     rs = st.secrets["remote_server"]
     return rs.get("revista_dir", rs["dir"].rsplit("/editorial", 1)[0]).rstrip("/")
-
 
 def _ensure_remote_dir(sftp, path: str):
     parts = path.rstrip("/").split("/")
@@ -122,7 +107,6 @@ def _ensure_remote_dir(sftp, path: str):
                 sftp.mkdir(current)
             except OSError as e:
                 _log_error(f"mkdir {current}", e)
-
 
 def _cleanup_old_backups(sftp, base_name: str, keep_days: int = 30):
     try:
@@ -142,14 +126,14 @@ def _cleanup_old_backups(sftp, base_name: str, keep_days: int = 30):
     except Exception as e:
         _log_error("cleanup backups", e)
 
-
 # ============================================================
 # LOCKS
 # ============================================================
 def _lock_path(name: str) -> str:
     rs = st.secrets["remote_server"]
-    return f"{rs['dir'].rstrip('/')}/.locks/{name}.lock"
-
+    # Limpieza extra de barras para evitar errores de ruta
+    base = rs['dir'].rstrip('/')
+    return f"{base}/.locks/{name}.lock"
 
 def _acquire_lock(name: str, timeout: int = LOCK_TIMEOUT_SEC) -> str | None:
     try:
@@ -168,12 +152,7 @@ def _acquire_lock(name: str, timeout: int = LOCK_TIMEOUT_SEC) -> str | None:
                     pass
 
                 f = sftp.open(path, "x")
-                f.write(
-                    json.dumps({
-                        "login": st.session_state.get("editor_login", ""),
-                        "ts": datetime.now().isoformat(timespec="seconds"),
-                    }).encode("utf-8")
-                )
+                f.write(json.dumps({"login": st.session_state.get("editor_login", ""), "ts": datetime.now().isoformat(timespec="seconds")}).encode("utf-8"))
                 f.close()
                 sftp.close(); transport.close()
                 return path
@@ -185,19 +164,21 @@ def _acquire_lock(name: str, timeout: int = LOCK_TIMEOUT_SEC) -> str | None:
         _log_error(f"acquire lock {name}", e)
         return None
 
-
-def _release_lock(name: str):
+def _release_lock(name: str) -> bool:
+    """Intenta borrar el lock. Devuelve True si lo logra o si ya no existía."""
     try:
         transport, sftp = _sftp_connect()
         path = _lock_path(name)
         try:
             sftp.remove(path)
+            success = True
         except IOError:
-            pass
+            success = False  # El archivo no existía
         sftp.close(); transport.close()
+        return success
     except Exception as e:
         _log_error(f"release lock {name}", e)
-
+        return False
 
 def _break_stale_lock(name: str, max_age_sec: int = LOCK_MAX_AGE):
     try:
@@ -439,7 +420,6 @@ def save_submission_json(tracking_id, data):
         st.error(f"Error saving {tracking_id}.json: {e}")
         return False
 
-
 # ============================================================
 # LOG / TOKENS
 # ============================================================
@@ -485,7 +465,8 @@ def revoke_token(articulo_id: str, email: str):
     if mask.any():
         df.loc[mask, "token"] = ""
         save_confirmations(df)
-        append_log("REVOKE-TOKEN", articulo_id, email)        
+        append_log("REVOKE-TOKEN", articulo_id, email)
+
 
 # ============================================================
 # EMAIL
@@ -848,7 +829,7 @@ def publish_to_zenodo_idempotent(articulo_id, submission_data, pdf_bytes, volume
             r = _zenodo_request("POST", f"{api_url}/deposit/depositions",
                                 headers=headers_json, json_data={"metadata": metadata})
             dep = r.json()
-            
+
             if "id" not in dep or "links" not in dep:
                 return False, f"Respuesta inesperada de Zenodo: {str(dep)[:200]}", ""
 
@@ -870,21 +851,20 @@ def publish_to_zenodo_idempotent(articulo_id, submission_data, pdf_bytes, volume
                 dep_info = r.json()
                 bucket_url = dep_info.get("links", {}).get("bucket", "")
                 zen["bucket_url"] = bucket_url
-                
+
             filename = f"{articulo_id}.pdf"
-            
+
             if not _is_valid_pdf(pdf_bytes):
                 return False, "El archivo no es un PDF válido (magic bytes incorrectos).", ""
 
-            # CORRECCIÓN DEFINITIVA: BytesIO y sin Content-Type manual
             pdf_stream = io.BytesIO(pdf_bytes)
             upload_headers = {"Authorization": f"Bearer {token}"}
-            
-            r_upload = requests.put(f"{bucket_url}/{filename}", 
-                                    headers=upload_headers, 
-                                    data=pdf_stream, 
+
+            r_upload = requests.put(f"{bucket_url}/{filename}",
+                                    headers=upload_headers,
+                                    data=pdf_stream,
                                     timeout=300)
-            
+
             if r_upload.status_code >= 400:
                 return False, f"Error subiendo archivo a Zenodo ({r_upload.status_code}): {r_upload.text}", ""
 
@@ -898,7 +878,7 @@ def publish_to_zenodo_idempotent(articulo_id, submission_data, pdf_bytes, volume
                                 f"{api_url}/deposit/depositions/{dep_id}/actions/publish",
                                 headers=headers_json)
             published = r.json()
-            
+
             if "doi" not in published and "links" not in published:
                 return False, f"Error al publicar en Zenodo: {str(published)[:200]}", ""
 
@@ -1371,12 +1351,20 @@ def tab_articles():
                         if st.button("🚀 Advance to 'todos_aprobados' (force)",
                                      key=f"force_adv_{aid}",
                                      use_container_width=True, type="primary"):
-                            # CORRECCIÓN CLAVE: forzar borrado del lock si tiene >5 seg de antigüedad
-                            _break_stale_lock(aid, max_age_sec=5)
 
-                            lock = _acquire_lock(aid, timeout=5)
+                            # 1. Intentar adquirir el lock normalmente
+                            lock = _acquire_lock(aid, timeout=2)
+
+                            # 2. Si falla, forzar el borrado del lock
                             if not lock:
-                                st.error("Manuscrito bloqueado. Si estás seguro de que nadie más lo está editando, espera 5 segundos y vuelve a intentarlo.")
+                                success = _release_lock(aid) # Intento de borrado a la fuerza
+                                if not success:
+                                    st.error("El servidor SFTP denegó el borrado del archivo .lock. Revisa los permisos de la carpeta .locks en tu servidor.")
+                                else:
+                                    lock = _acquire_lock(aid, timeout=2) # Reintentar
+
+                            if not lock:
+                                st.error("Manuscrito bloqueado. Si estás seguro de que nadie más lo está editando, borra el archivo .lock manualmente.")
                             else:
                                 try:
                                     df_full = read_articles()
