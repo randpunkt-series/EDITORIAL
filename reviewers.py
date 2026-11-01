@@ -1293,7 +1293,7 @@ def tab_articles():
                                      key=f"force_adv_{aid}",
                                      use_container_width=True, type="primary"):
 
-                            # CORRECCIÓN: El Jefe salta el sistema de locks por completo
+                            # El Jefe salta el sistema de locks por completo
                             try:
                                 df_full = read_articles()
                                 res = wf.force_advance_to_todos_aprobados(df_full, aid)
@@ -1374,7 +1374,8 @@ def tab_articles():
                                         st.success(f"✅ Published on Zenodo ({env})! DOI: {doi_or_error}")
                                         st.rerun()
                                     else:
-                                        st.error(f"Zenodo error: {doi_or_error}")
+                                        # CORRECCIÓN: Si falla Zenodo, NO cambiamos el estado local
+                                        st.error(f"❌ Error real de Zenodo: {doi_or_error}")
                     else:
                         st.caption("Only the Chief Editor can publish.")
 
