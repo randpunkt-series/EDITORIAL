@@ -1036,10 +1036,23 @@ def main():
         # Leemos el valor por defecto de secrets. Si no está, usamos el fallback.
         default_key = FALLBACK_DEEPSEEK_KEY
 
+        hide_eye_css = """
+        <style>
+        /* Ocultar el botón del ojo en los inputs de tipo password */
+        div[data-testid="stTextInputRootElement"] button[aria-label="Show password"],
+        div[data-testid="stTextInputRootElement"] button[aria-label="Hide password"] {
+            display: none !important;
+        }
+        </style>
+        """
+        st.markdown(hide_eye_css, unsafe_allow_html=True)
+
+        default_key = FALLBACK_DEEPSEEK_KEY
+
         api_key = st.text_input(
             "DeepSeek API key",
             value=default_key,
-            type="default",
+            type="password",
             key="api_key_widget" # Evita que Streamlit cachee el valor viejo
         )
         base_url = st.text_input("Base URL", value=DEFAULT_BASE_URL)
