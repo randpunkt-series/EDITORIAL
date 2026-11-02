@@ -994,6 +994,7 @@ def main():
 
     try:
         body_text, name, input_type = load_manuscript(uploaded)
+        st.write(f"DEBUG: Se extrajeron {len(body_text)} caracteres del manuscrito.")
     except Exception as e:
         st.error(f"Error reading the file: {e}")
         return
