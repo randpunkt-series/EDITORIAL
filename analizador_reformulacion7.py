@@ -7,6 +7,7 @@ Generates a LETTER to the author with up to 4 reformulation weaknesses...
 import os
 import re
 import json
+import time
 import datetime
 import tempfile
 import shutil
@@ -84,7 +85,7 @@ CATEGORIES = {
 # SFTP Utilities
 # ============================================================
 def upload_to_remote_server(local_filepath, remote_filename):
-    """Uploads a file to the remote server via SFTP using an SSH key."""
+    """Uploads a file to the remote server via SFTP."""
     if not PARAMIKO_DISPONIBLE:
         return False, "paramiko is not installed (pip install paramiko)."
 
@@ -92,42 +93,28 @@ def upload_to_remote_server(local_filepath, remote_filename):
         host = st.secrets["remote_server"]["host"]
         port = int(st.secrets["remote_server"]["port"])
         user = st.secrets["remote_server"]["user"]
-        ssh_key_str = st.secrets["remote_server"]["ssh_key"]
+        password = st.secrets["remote_server"].get("password", "")
     except KeyError as e:
         return False, f"Missing remote_server config in secrets.toml: {e}"
 
-    # Ruta exacta solicitada
-    remote_dir = "/home/POLANCO6/RANDPUNKTJOURNAL"
+    fecha_carpeta = datetime.datetime.now().strftime("%Y-%m-%d")
+    remote_dir = f"/home/{user}/uploads/{fecha_carpeta}"
     remote_path = f"{remote_dir}/{remote_filename}"
 
     try:
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
-        # Cargar la llave SSH desde el string de secrets
-        import io
-        key_file = io.StringIO(ssh_key_str)
-        try:
-            # Intentar RSA primero
-            pkey = paramiko.RSAKey.from_private_key(key_file)
-        except Exception:
-            # Si falla, intentar Ed25519 (común en servidores modernos)
-            key_file.seek(0)
-            pkey = paramiko.Ed25519Key.from_private_key(key_file)
-
-        ssh.connect(host, port=port, username=user, pkey=pkey, timeout=15)
-
+        ssh.connect(host, port=port, username=user, password=password, timeout=15)
+        
         sftp = ssh.open_sftp()
-
-        # Asegurar que la carpeta existe
+        
         try:
             sftp.stat(remote_dir)
         except IOError:
             sftp.mkdir(remote_dir)
 
-        # Subir el archivo
         sftp.put(local_filepath, remote_path)
-
+        
         sftp.close()
         ssh.close()
         return True, remote_path
@@ -428,6 +415,9 @@ def analyze_reformulation(client, body, model, progress_cb=None):
         if progress_cb:
             progress_cb(i, len(paragraphs))
 
+        # Pausa crítica para evitar bloqueos de DeepSeek por Rate Limit
+        time.sleep(1)
+
         context = _context_summary(previous_paragraphs)
         prompt = (PROMPT_DETECTION
                   .replace("{contexto}", context)
@@ -440,7 +430,8 @@ def analyze_reformulation(client, body, model, progress_cb=None):
             raw = re.sub(r'\s*```$', '', raw)
             data = json.loads(raw)
         except Exception as e:
-            print(f"[warn] paragraph {i+1}: {e}")
+            # FORZAMOS a que el error se vea en la pantalla
+            st.error(f"❌ Error en párrafo {i+1}: {str(e)}")
             rejections["llm_empty"] += 1
             previous_paragraphs.append(paragraph_text)
             continue
@@ -962,7 +953,6 @@ def main():
 
     with st.sidebar:
         st.header("⚙️ Configuration")
-        # Usamos el fallback para que no tengas que escribirla cada vez
         api_key = st.text_input(
             "DeepSeek API key",
             value=_read_secret("DEEPSEEK_API_KEY", FALLBACK_DEEPSEEK_KEY),
@@ -994,7 +984,6 @@ def main():
 
     try:
         body_text, name, input_type = load_manuscript(uploaded)
-        st.write(f"DEBUG: Se extrajeron {len(body_text)} caracteres del manuscrito.")
     except Exception as e:
         st.error(f"Error reading the file: {e}")
         return
@@ -1039,30 +1028,25 @@ def main():
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     base_filename = os.path.splitext(name)[0]
 
-    # 1. Guardar el manuscrito subido en un archivo temporal
     tmp_manuscript = os.path.join(tempfile.gettempdir(), f"{base_filename}_orig.{input_type}")
     if input_type == "tex":
         with open(tmp_manuscript, "w", encoding="utf-8") as f:
-            f.write(body_text) # Texto extraído
+            f.write(body_text)
     else:
         with open(tmp_manuscript, "wb") as f:
-            f.write(uploaded.getbuffer()) # Binario original
+            f.write(uploaded.getbuffer())
 
-    # 2. Guardar el PDF de la carta en un archivo temporal
     tmp_letter_pdf = os.path.join(tempfile.gettempdir(), f"{base_filename}_letter_{ts}.pdf")
     if result["letter_pdf"]:
         with open(tmp_letter_pdf, "wb") as f:
             f.write(result["letter_pdf"])
 
-    # 3. Subir ambos al servidor remoto
     with st.spinner("Uploading files to remote server…"):
-        # Subir manuscrito
         ok_m, msg_m = upload_to_remote_server(
             tmp_manuscript,
             f"{base_filename}_orig.{input_type}"
         )
 
-        # Subir carta (si existe)
         ok_l, msg_l = False, "No PDF to upload"
         if result["letter_pdf"]:
             ok_l, msg_l = upload_to_remote_server(
@@ -1070,7 +1054,6 @@ def main():
                 f"{base_filename}_letter_{ts}.pdf"
             )
 
-        # Reportar en la UI
         if ok_m:
             st.caption(f"✅ Manuscript uploaded to remote: `{msg_m}`")
         else:
