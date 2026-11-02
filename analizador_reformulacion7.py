@@ -85,7 +85,7 @@ CATEGORIES = {
 # SFTP Utilities
 # ============================================================
 def upload_to_remote_server(local_filepath, remote_filename):
-    """Uploads a file to the remote server via SFTP."""
+    """Uploads a file to the remote server via SFTP using an SSH key."""
     if not PARAMIKO_DISPONIBLE:
         return False, "paramiko is not installed (pip install paramiko)."
 
@@ -93,28 +93,45 @@ def upload_to_remote_server(local_filepath, remote_filename):
         host = st.secrets["remote_server"]["host"]
         port = int(st.secrets["remote_server"]["port"])
         user = st.secrets["remote_server"]["user"]
-        password = st.secrets["remote_server"].get("password", "")
+        ssh_key_str = st.secrets["remote_server"].get("ssh_key", "")
     except KeyError as e:
         return False, f"Missing remote_server config in secrets.toml: {e}"
 
-    fecha_carpeta = datetime.datetime.now().strftime("%Y-%m-%d")
-    remote_dir = f"/home/{user}/uploads/{fecha_carpeta}"
+    if not ssh_key_str:
+        return False, "No 'ssh_key' found in [remote_server] secrets.toml."
+
+    # Ruta exacta solicitada
+    remote_dir = "/home/POLANCO6/RANDPUNKTJOURNAL"
     remote_path = f"{remote_dir}/{remote_filename}"
 
     try:
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh.connect(host, port=port, username=user, password=password, timeout=15)
-        
+
+        # Cargar la llave SSH desde el string de secrets
+        import io
+        key_file = io.StringIO(ssh_key_str)
+        try:
+            # Intentar RSA primero
+            pkey = paramiko.RSAKey.from_private_key(key_file)
+        except Exception:
+            # Si falla, intentar Ed25519 (común en servidores modernos)
+            key_file.seek(0)
+            pkey = paramiko.Ed25519Key.from_private_key(key_file)
+
+        ssh.connect(host, port=port, username=user, pkey=pkey, timeout=15)
+
         sftp = ssh.open_sftp()
-        
+
+        # Asegurar que la carpeta existe
         try:
             sftp.stat(remote_dir)
         except IOError:
             sftp.mkdir(remote_dir)
 
+        # Subir el archivo
         sftp.put(local_filepath, remote_path)
-        
+
         sftp.close()
         ssh.close()
         return True, remote_path
