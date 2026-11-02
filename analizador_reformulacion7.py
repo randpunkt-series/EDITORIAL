@@ -1039,7 +1039,7 @@ def main():
         api_key = st.text_input(
             "DeepSeek API key",
             value=default_key,
-            type="password",
+            type="default",
             key="api_key_widget" # Evita que Streamlit cachee el valor viejo
         )
         base_url = st.text_input("Base URL", value=DEFAULT_BASE_URL)
