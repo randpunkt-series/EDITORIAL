@@ -389,6 +389,7 @@ def _call(client, prompt, model, max_tokens=2000, temperature=0.2):
         messages=[{"role": "user", "content": prompt}],
         temperature=temperature,
         max_tokens=max_tokens,
+        timeout=90  # Aumentado para textos largos
     )
     return r.choices[0].message.content.strip()
 
@@ -403,7 +404,7 @@ def _context_summary(previous_paragraphs, max_chars=1200):
 
 
 # ============================================================
-# Main analysis
+# Main analysis (Chunked for Rate Limit Avoidance)
 # ============================================================
 def analyze_reformulation(client, body, model, progress_cb=None):
     paragraphs = split_paragraphs(body)
@@ -411,58 +412,122 @@ def analyze_reformulation(client, body, model, progress_cb=None):
     rejections = {"llm_empty": 0, "validation": 0, "new_data": 0}
     previous_paragraphs = []
 
-    for i, (start, end, paragraph_text) in enumerate(paragraphs):
-        if progress_cb:
-            progress_cb(i, len(paragraphs))
+    # Agrupar párrafos en lotes de 10 para no saturar la API de DeepSeek
+    chunk_size = 10
+    chunks = [paragraphs[i:i + chunk_size] for i in range(0, len(paragraphs), chunk_size)]
 
-        # Pausa crítica para evitar bloqueos de DeepSeek por Rate Limit
-        time.sleep(1)
+    for chunk_idx, chunk in enumerate(chunks):
+        if progress_cb:
+            # El progreso avanza por bloques, no por párrafos
+            progress_cb(chunk_idx, len(chunks))
+
+        time.sleep(2) # Pausa de 2 segundos entre bloques (no entre párrafos)
+
+        # Unir los 10 párrafos del bloque en un solo texto
+        chunk_text = ""
+        for p_idx, (_, _, p_text) in enumerate(chunk):
+            chunk_text += f"[PÁRRAFO {p_idx+1}]\n{p_text}\n\n"
 
         context = _context_summary(previous_paragraphs)
-        prompt = (PROMPT_DETECTION
-                  .replace("{contexto}", context)
-                  .replace("{parrafo}", paragraph_text))
+
+        # Prompt adaptado para análisis por bloques
+        prompt = f"""
+        You are an academic editor. I give you a CONTEXT and a set of PARAGRAPHS.
+        Identify up to 3 reformulation weaknesses in these paragraphs.
+        A weakness is a problem that can be solved by REWRITING the text, WITHOUT the need for new experiments, new data, new citations, or new measurements.
+
+        ALLOWED CATEGORIES:
+        - ambiguedad_conceptual
+        - generalizacion_sin_matiz
+        - no_sustentada_por_texto
+        - estructura_argumental_debil
+        - redundancia_interna
+        - vaguedad_cuantitativa
+
+        OUTPUT FORMAT (strict JSON, no Markdown):
+        {{
+          "debilidades": [
+            {{
+              "categoria": "one_of_the_allowed_categories",
+              "fragmento": "literal fragment of the paragraph (EXACT COPY)",
+              "diagnostico": "what is weak and why (1-2 sentences)",
+              "impacto": "why it matters to the reader (1 sentence)",
+              "pasos": ["step 1", "step 2"],
+              "reescritura_A": "conservative reformulated version",
+              "reescritura_B": "alternative reformulated version",
+              "criterio_verificacion": "how to know it is resolved"
+            }}
+          ]
+        }}
+        If no weaknesses are found, return: {{"debilidades": []}}
+
+        CONTEXT:
+        {context}
+
+        PARAGRAPHS:
+        {chunk_text}
+        """
 
         try:
-            raw = _call(client, prompt, model, max_tokens=1500,
-                        temperature=0.2)
+            raw = _call(client, prompt, model, max_tokens=3000, temperature=0.2)
             raw = re.sub(r'^```(?:json)?\s*', '', raw)
             raw = re.sub(r'\s*```$', '', raw)
             data = json.loads(raw)
         except Exception as e:
-            # FORZAMOS a que el error se vea en la pantalla
-            st.error(f"❌ Error en párrafo {i+1}: {str(e)}")
+            st.error(f"❌ Error en bloque {chunk_idx+1}: {str(e)}")
             rejections["llm_empty"] += 1
-            previous_paragraphs.append(paragraph_text)
+            for _, _, p_text in chunk:
+                previous_paragraphs.append(p_text)
             continue
 
-        deb = data.get("debilidad")
-        if not deb:
+        debilidades = data.get("debilidades", [])
+        if not debilidades:
             rejections["llm_empty"] += 1
-            previous_paragraphs.append(paragraph_text)
+            for _, _, p_text in chunk:
+                previous_paragraphs.append(p_text)
             continue
 
-        ok, reason = validate_weakness(deb, paragraph_text)
-        if not ok:
-            if "new data" in reason:
-                rejections["new_data"] += 1
+        # Validar y guardar las debilidades encontradas en este bloque
+        for deb in debilidades:
+            # Buscar a qué párrafo del bloque pertenece el fragmento
+            found_paragraph = None
+            found_start = 0
+            found_line = 0
+            found_section = "(no section)"
+            found_idx = 0
+
+            for p_idx, (start, end, p_text) in enumerate(chunk):
+                ok, reason = validate_weakness(deb, p_text)
+                if ok:
+                    section, line = locate_section(body, start)
+                    found_paragraph = p_text
+                    found_start = start
+                    found_line = line
+                    found_section = section
+                    # Intentar obtener el índice global del párrafo
+                    try:
+                        found_idx = paragraphs.index((start, end, p_text))
+                    except ValueError:
+                        found_idx = 0
+                    break
+
+            if found_paragraph:
+                results.append({
+                    "paragraph_idx": found_idx,
+                    "paragraph_start": found_start,
+                    "paragraph_end": found_start + len(found_paragraph),
+                    "paragraph_text": found_paragraph,
+                    "section": found_section,
+                    "line": found_line,
+                    "weakness": deb,
+                })
             else:
                 rejections["validation"] += 1
-            previous_paragraphs.append(paragraph_text)
-            continue
 
-        section, line = locate_section(body, start)
-        results.append({
-            "paragraph_idx": i,
-            "paragraph_start": start,
-            "paragraph_end": end,
-            "paragraph_text": paragraph_text,
-            "section": section,
-            "line": line,
-            "weakness": deb,
-        })
-        previous_paragraphs.append(paragraph_text)
+        for _, _, p_text in chunk:
+            previous_paragraphs.append(p_text)
 
+    # Priorizar los resultados y tomar los 4 mejores
     priority = {
         "no_sustentada_por_texto": 0,
         "ambiguedad_conceptual": 1,
@@ -1004,7 +1069,7 @@ def main():
     def _cb(i, n):
         pct = (i + 1) / max(n, 1)
         progress_bar.progress(min(pct, 1.0))
-        status.info(f"Analyzing paragraph {i + 1}/{n}…")
+        status.info(f"Analyzing paragraph block {i + 1}/{n}…")
 
     result = run_pipeline(
         body_text=body_text,
