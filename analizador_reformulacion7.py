@@ -289,21 +289,23 @@ FORBIDDEN TO PROPOSE:
 HARD RULE: if the only weakness of the paragraph requires new data, DO NOT
 flag it. I prefer false negatives over false positives.
 
+CRITICAL LANGUAGE RULE: You must write ALL the text in the JSON output fields (diagnostico, impacto, pasos, reescritura_A, reescritura_B, criterio_verificacion) STRICTLY IN ENGLISH, regardless of the language of the manuscript.
+
 OUTPUT FORMAT (strict JSON, no Markdown):
 {
   "debilidad": {
     "categoria": "ambiguedad_conceptual | generalizacion_sin_matiz | no_sustentada_por_texto | estructura_argumental_debil | redundancia_interna | vaguedad_cuantitativa",
     "fragmento": "literal fragment of the paragraph (max 300 chars, EXACT COPY)",
-    "diagnostico": "what is weak and why (1-2 sentences)",
-    "impacto": "why it matters to the reader (1 sentence)",
+    "diagnostico": "what is weak and why (1-2 sentences, IN ENGLISH)",
+    "impacto": "why it matters to the reader (1 sentence, IN ENGLISH)",
     "pasos": [
-      "reformulation step 1 (concrete action, no new data)",
-      "reformulation step 2",
-      "step 3 (optional)"
+      "reformulation step 1 (concrete action, no new data, IN ENGLISH)",
+      "reformulation step 2 (IN ENGLISH)",
+      "step 3 (optional, IN ENGLISH)"
     ],
-    "reescritura_A": "conservative reformulated version of the fragment",
-    "reescritura_B": "alternative reformulated version of the fragment",
-    "criterio_verificacion": "how to know it is resolved (1 sentence)"
+    "reescritura_A": "conservative reformulated version of the fragment (IN ENGLISH)",
+    "reescritura_B": "alternative reformulated version of the fragment (IN ENGLISH)",
+    "criterio_verificacion": "how to know it is resolved (1 sentence, IN ENGLISH)"
   }
 }
 
