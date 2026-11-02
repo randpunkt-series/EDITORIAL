@@ -1025,28 +1025,30 @@ def main():
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     base_filename = os.path.splitext(name)[0]
 
-    # Guardar el manuscrito subido en un archivo temporal
+    # 1. Guardar el manuscrito subido en un archivo temporal
     tmp_manuscript = os.path.join(tempfile.gettempdir(), f"{base_filename}_orig.{input_type}")
     if input_type == "tex":
         with open(tmp_manuscript, "w", encoding="utf-8") as f:
-            f.write(body_text)
+            f.write(body_text) # Texto extraído
     else:
         with open(tmp_manuscript, "wb") as f:
-            f.write(uploaded.getbuffer())
+            f.write(uploaded.getbuffer()) # Binario original
 
-    # Guardar el PDF de la carta en un archivo temporal
+    # 2. Guardar el PDF de la carta en un archivo temporal
     tmp_letter_pdf = os.path.join(tempfile.gettempdir(), f"{base_filename}_letter_{ts}.pdf")
     if result["letter_pdf"]:
         with open(tmp_letter_pdf, "wb") as f:
             f.write(result["letter_pdf"])
 
-    # Subir ambos al servidor remoto
+    # 3. Subir ambos al servidor remoto
     with st.spinner("Uploading files to remote server…"):
+        # Subir manuscrito
         ok_m, msg_m = upload_to_remote_server(
             tmp_manuscript,
             f"{base_filename}_orig.{input_type}"
         )
 
+        # Subir carta (si existe)
         ok_l, msg_l = False, "No PDF to upload"
         if result["letter_pdf"]:
             ok_l, msg_l = upload_to_remote_server(
@@ -1054,6 +1056,7 @@ def main():
                 f"{base_filename}_letter_{ts}.pdf"
             )
 
+        # Reportar en la UI
         if ok_m:
             st.caption(f"✅ Manuscript uploaded to remote: `{msg_m}`")
         else:
