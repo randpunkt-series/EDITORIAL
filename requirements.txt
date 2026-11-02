@@ -4,3 +4,4 @@ pandas
 paramiko
 openai
 python-docx
+paramiko

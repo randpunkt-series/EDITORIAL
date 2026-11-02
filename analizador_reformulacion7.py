@@ -2,35 +2,7 @@
 r"""
 analizador_reformulacion.py — Streamlit standalone.
 
-Generates a LETTER to the author with up to 4 reformulation weaknesses
-detected in a manuscript (.tex or .docx). For each weakness it provides:
-    - location (section, paragraph, line)
-    - fragment in PLAIN TEXT (without manuscript LaTeX, to avoid
-      dragging broken commands)
-    - diagnosis
-    - category (conceptual ambiguity, overgeneralization, unsupported,
-      weak structure, redundancy, quantitative vagueness)
-    - concrete implementation steps
-    - two rewrites (A conservative, B alternative)
-    - verification criterion
-
-The letter is compiled with pdflatex/lualatex/xelatex and auto-corrected
-in a loop if there are typesetting errors (not content errors). Includes
-the logo `randpunkt-logo.pdf` centered in the header of ALL pages, and
-adds a watermark.
-
-The letter is the ONLY artifact of the program. The manuscript is not
-annotated, no .md report is generated, no citations are searched, no
-.bib is validated.
-
-Usage:
-    streamlit run analizador_reformulacion.py
-
-Requirements:
-    - openai (DeepSeek), streamlit
-    - python-docx (if .docx files are uploaded)
-    - pdflatex / lualatex / xelatex (TeX Live / MiKTeX / MacTeX)
-    - randpunkt-logo.pdf (optional, in the same directory as the script)
+Generates a LETTER to the author with up to 4 reformulation weaknesses...
 """
 import os
 import re
@@ -54,14 +26,19 @@ try:
 except ImportError:
     DOCX_DISPONIBLE = False
 
+try:
+    import paramiko
+    PARAMIKO_DISPONIBLE = True
+except ImportError:
+    PARAMIKO_DISPONIBLE = False
+
 # ============================================================
-# Configuration
+# Configuration & Secrets Fallback
 # ============================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEBUG_DIR = os.path.join(BASE_DIR, "debug")
 os.makedirs(DEBUG_DIR, exist_ok=True)
 
-# Optional logo: if present alongside the script, it is included in the letter.
 LOGO_PATH = os.path.join(BASE_DIR, "randpunkt-logo.pdf")
 LOGO_DISPONIBLE = os.path.isfile(LOGO_PATH) and os.path.getsize(LOGO_PATH) > 0
 
@@ -72,6 +49,15 @@ MAX_QUESTIONS = 4
 MIN_PARAGRAPH_LENGTH = 120
 MAX_FRAGMENT_LENGTH = 300
 MAX_FRAGMENT_LETTER = 300
+
+# Valores por defecto inyectados directamente (o desde secrets si existen)
+def _get_secret(section, key, default=""):
+    try:
+        return st.secrets[section][key]
+    except Exception:
+        return default
+
+FALLBACK_DEEPSEEK_KEY = _get_secret("", "DEEPSEEK_API_KEY", "sk-fe5")
 
 CATEGORIES = {
     "ambiguedad_conceptual": (
@@ -93,6 +79,48 @@ CATEGORIES = {
         "Vague quantification ('many studies', 'a large percentage', "
         "'frequently') without a number, range, or reference."),
 }
+
+# ============================================================
+# SFTP Utilities
+# ============================================================
+def upload_to_remote_server(local_filepath, remote_filename):
+    """Uploads a file to the remote server via SFTP."""
+    if not PARAMIKO_DISPONIBLE:
+        return False, "paramiko is not installed (pip install paramiko)."
+
+    try:
+        host = st.secrets["remote_server"]["host"]
+        port = int(st.secrets["remote_server"]["port"])
+        user = st.secrets["remote_server"]["user"]
+        # Si no hay password en secrets, intentamos usar el user o vacío
+        password = st.secrets["remote_server"].get("password", "")
+    except KeyError as e:
+        return False, f"Missing remote_server config in secrets.toml: {e}"
+
+    fecha_carpeta = datetime.datetime.now().strftime("%Y-%m-%d")
+    remote_dir = f"/home/{user}/uploads/{fecha_carpeta}"
+    remote_path = f"{remote_dir}/{remote_filename}"
+
+    try:
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect(host, port=port, username=user, password=password, timeout=15)
+        
+        sftp = ssh.open_sftp()
+        
+        try:
+            sftp.stat(remote_dir)
+        except IOError:
+            sftp.mkdir(remote_dir)
+
+        sftp.put(local_filepath, remote_path)
+        
+        sftp.close()
+        ssh.close()
+        return True, remote_path
+    except Exception as e:
+        return False, str(e)
+
 
 # ============================================================
 # Text extraction
@@ -124,7 +152,6 @@ def extract_text_tex(text):
 
 
 def load_manuscript(uploaded_file):
-    """Returns (text, name, type). type ∈ {'tex', 'docx'}."""
     name = uploaded_file.name
     ext = os.path.splitext(name)[1].lower()
 
@@ -150,7 +177,6 @@ def load_manuscript(uploaded_file):
 # Text utilities
 # ============================================================
 def split_paragraphs(body):
-    """List of (start, end, text) of non-empty paragraphs."""
     paragraphs = []
     for m in re.finditer(r'([^\n](?:.*?[^\n])?)\n\s*\n', body, re.DOTALL):
         text = m.group(1).strip()
@@ -180,7 +206,6 @@ def _clean_for_comparison(s):
 
 
 def _fragment_to_plain_text(fragment, max_chars=MAX_FRAGMENT_LETTER):
-    """Converts a LaTeX fragment to readable plain text for the letter."""
     if not fragment:
         return ""
     s = fragment
@@ -197,17 +222,12 @@ def _fragment_to_plain_text(fragment, max_chars=MAX_FRAGMENT_LETTER):
     return s
 
 
-# ============================================================
-# LaTeX utilities
-# ============================================================
 def _escape_latex(s):
-    """Escapes ONLY plain text that is NOT LaTeX."""
     if not s:
         return ""
     replacements = {
-        '\\': r'\textbackslash{}',
-        '&': r'\&', '%': r'\%', '$': r'\$', '#': r'\#',
-        '_': r'\_', '{': r'\{', '}': r'\}',
+        '\\': r'\textbackslash{}', '&': r'\&', '%': r'\%', '$': r'\$',
+        '#': r'\#', '_': r'\_', '{': r'\{', '}': r'\}',
         '~': r'\textasciitilde{}', '^': r'\textasciicircum{}',
     }
     for k, v in replacements.items():
@@ -216,17 +236,12 @@ def _escape_latex(s):
 
 
 def _escape_plain_text(s):
-    """Escapes only problematic characters in plain text."""
     if not s:
         return ""
-    replacements = {
-        '&': r'\&', '%': r'\%', '#': r'\#',
-        '_': r'\_',
-    }
+    replacements = {'&': r'\&', '%': r'\%', '#': r'\#', '_': r'\_'}
     for k, v in replacements.items():
         s = s.replace(k, v)
     return s
-
 
 # ============================================================
 # Detection prompt
@@ -285,6 +300,7 @@ PARAGRAPH:
 {parrafo}
 """
 
+
 # ============================================================
 # Post-filter: discard weaknesses that ask for new data
 # ============================================================
@@ -313,7 +329,6 @@ def _already_has_citation(fragment):
 
 
 def validate_weakness(deb, paragraph):
-    """Returns (ok, reason)."""
     if not deb:
         return False, "no weakness"
 
@@ -391,11 +406,6 @@ def _context_summary(previous_paragraphs, max_chars=1200):
 # Main analysis
 # ============================================================
 def analyze_reformulation(client, body, model, progress_cb=None):
-    """
-    Returns (results, stats).
-    results: list of dicts with paragraph_idx, section, line,
-             paragraph_text, weakness.
-    """
     paragraphs = split_paragraphs(body)
     results = []
     rejections = {"llm_empty": 0, "validation": 0, "new_data": 0}
@@ -644,23 +654,11 @@ def _latex_engine_available(engine="pdflatex"):
 
 
 def _latex_available():
-    """True if at least one LaTeX engine is in the PATH."""
     return any(_latex_engine_available(e) for e in
                ("pdflatex", "lualatex", "xelatex"))
 
 
 def compile_latex(tex_str, timeout=60, engine="pdflatex"):
-    """Compiles tex_str in a tmpdir with the specified engine.
-
-    Returns (ok, log, pdf_bytes|None).
-
-    - Copies the logo to the tmpdir if LOGO_DISPONIBLE, so that
-      \\includegraphics{randpunkt-logo.pdf} finds it even though
-      the tmpdir is isolated.
-    - Verifies that the PDF exists and has size > 0.
-    - Captures bytes and decodes in cascade (utf-8 -> latin-1 -> replace)
-      so it doesn't break with logs in cp1252/latin-1.
-    """
     if not _latex_engine_available(engine):
         return False, f"{engine} is not installed on the system.", None
 
@@ -669,7 +667,6 @@ def compile_latex(tex_str, timeout=60, engine="pdflatex"):
         with open(tex_path, "w", encoding="utf-8", newline="\n") as f:
             f.write(tex_str)
 
-        # Copy the logo to the tmpdir if available and the .tex uses it.
         if LOGO_DISPONIBLE and "randpunkt-logo.pdf" in tex_str:
             try:
                 shutil.copy2(LOGO_PATH,
@@ -723,30 +720,20 @@ def compile_latex(tex_str, timeout=60, engine="pdflatex"):
 
 
 # ------------------------------------------------------------
-# Auto-correction rules (only TYPESETTING errors, not content)
+# Auto-correction rules
 # ------------------------------------------------------------
 _AUTOFIX_RULES = [
-    # Double escape of \textbackslash{} followed by a command
     (re.compile(r'\\textbackslash\{\}((?:[a-zA-Z]+))'), r'\\\1'),
-    # Double escape of braces
     (re.compile(r'\\textbackslash\{\}\{'), r'{'),
     (re.compile(r'\\textbackslash\{\}\}'), r'}'),
-    # \textasciitilde{} glued to a command or isolated
     (re.compile(r'\\textasciitilde\{\}\s*(\\[a-zA-Z]+)'), r'~\1'),
     (re.compile(r'(?:\\textasciitilde\{\})+'), r'~'),
-    # \textbackslash{}ldots / \textbackslash{}dots
     (re.compile(r'\\textbackslash\{\}(ldots|dots|LaTeX|TeX)\b'), r'\\\1'),
-    # Literal \n
     (re.compile(r'(?<!\\)\\n\\n'), r'\n\n'),
-    # \textbackslash{}' (broken accent)
     (re.compile(r"\\textbackslash\{\}'"), r"'"),
-    # Orphan \textbackslash{} at end of word
     (re.compile(r'\\textbackslash\{\}(?=\s|$|[.,;:])'), r'\\'),
-    # \emph without braces -> \emph{...} until end of word
     (re.compile(r'\\emph(?![{\s])\s*([^{}\n]+)'), r'\\emph{\1}'),
-    # Orphan \emph followed by \ldots -> remove \emph
     (re.compile(r'\\emph\s*\\ldots'), r'\\ldots'),
-    # Orphan \textbackslash{} inside math
     (re.compile(r'\$\s*\\textbackslash\{\}\s*\$'), r'$ $'),
 ]
 
@@ -774,8 +761,6 @@ def _balance_braces(tex):
 
 
 def _sanitize_latex(tex):
-    """Removes lines that clearly are not LaTeX (shebang, imports).
-    Keeps from \\documentclass onwards."""
     if not tex:
         return tex
     lines = tex.splitlines()
@@ -790,7 +775,6 @@ def _sanitize_latex(tex):
 
 
 def _is_valid_latex(tex):
-    """Checks that the string looks like a complete LaTeX document."""
     if not tex or not isinstance(tex, str):
         return False
     if r"\documentclass" not in tex:
@@ -806,11 +790,6 @@ def _is_valid_latex(tex):
 
 def auto_correct_latex(tex_str, max_iter=4, verbose=False,
                        engines=("pdflatex", "lualatex", "xelatex")):
-    """Applies _AUTOFIX_RULES + _fix_underscores + compiles in a loop.
-
-    If the primary engine fails, tries the alternatives before
-    giving up. Returns (final_tex, ok, log, pdf_bytes, corrections).
-    """
     corrections = []
     tex = tex_str
     log = ""
@@ -872,26 +851,12 @@ def auto_correct_latex(tex_str, max_iter=4, verbose=False,
 # ============================================================
 def run_pipeline(body_text, api_key, base_url, model,
                  progress_cb=None, manuscript_name="manuscript.tex"):
-    """Letter-centered pipeline with PDF guarantee.
-
-    Returns:
-      - letter_tex    : str with the final .tex (corrected or not)
-      - letter_ok     : bool, if it compiled
-      - letter_log    : LaTeX log (for diagnosis)
-      - letter_pdf    : PDF bytes or None
-      - corrections   : list of applied corrections
-      - stats         : analysis statistics
-      - results       : detected weaknesses
-      - logo_used     : bool, if the letter includes the logo
-      - error         : str or None (if something unrecoverable failed)
-    """
     client = OpenAI(api_key=api_key, base_url=base_url)
 
     def _cb(i, n):
         if progress_cb:
             progress_cb(i, n)
 
-    # 1. LLM analysis
     try:
         results, stats = analyze_reformulation(
             client, body_text, model, progress_cb=_cb)
@@ -903,7 +868,6 @@ def run_pipeline(body_text, api_key, base_url, model,
             "error": f"LLM analysis: {e}",
         }
 
-    # 2. Build letter (includes logo if available)
     try:
         letter_tex = generate_latex_letter(
             stats, results, manuscript_name,
@@ -918,11 +882,8 @@ def run_pipeline(body_text, api_key, base_url, model,
         }
 
     logo_used = LOGO_DISPONIBLE and "randpunkt-logo.pdf" in letter_tex
-
-    # 3. Sanitization: remove any non-LaTeX lines at the start.
     letter_tex = _sanitize_latex(letter_tex)
 
-    # 4. Validation: never compile something that is not real LaTeX.
     if not _is_valid_latex(letter_tex):
         return {
             "letter_tex": letter_tex, "letter_ok": False,
@@ -935,7 +896,6 @@ def run_pipeline(body_text, api_key, base_url, model,
             "error": None,
         }
 
-    # 5. Compile/auto-correct with retry across engines.
     try:
         final_letter, letter_ok, letter_log, letter_pdf, corrections = (
             auto_correct_latex(letter_tex))
@@ -989,9 +949,10 @@ def main():
 
     with st.sidebar:
         st.header("⚙️ Configuration")
+        # Usamos el fallback para que no tengas que escribirla cada vez
         api_key = st.text_input(
             "DeepSeek API key",
-            value=_read_secret("DEEPSEEK_API_KEY"),
+            value=_read_secret("DEEPSEEK_API_KEY", FALLBACK_DEEPSEEK_KEY),
             type="password")
         base_url = st.text_input("Base URL", value=DEFAULT_BASE_URL)
         model = st.text_input("Model", value=DEFAULT_MODEL)
@@ -1058,7 +1019,55 @@ def main():
         return
     status.success("Letter generated.")
 
-    # --- Summary ---
+    # --------------------------------------------------------
+    # Backup to remote server via SFTP
+    # --------------------------------------------------------
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    base_filename = os.path.splitext(name)[0]
+
+    # Guardar el manuscrito subido en un archivo temporal
+    tmp_manuscript = os.path.join(tempfile.gettempdir(), f"{base_filename}_orig.{input_type}")
+    if input_type == "tex":
+        with open(tmp_manuscript, "w", encoding="utf-8") as f:
+            f.write(body_text)
+    else:
+        with open(tmp_manuscript, "wb") as f:
+            f.write(uploaded.getbuffer())
+
+    # Guardar el PDF de la carta en un archivo temporal
+    tmp_letter_pdf = os.path.join(tempfile.gettempdir(), f"{base_filename}_letter_{ts}.pdf")
+    if result["letter_pdf"]:
+        with open(tmp_letter_pdf, "wb") as f:
+            f.write(result["letter_pdf"])
+
+    # Subir ambos al servidor remoto
+    with st.spinner("Uploading files to remote server…"):
+        ok_m, msg_m = upload_to_remote_server(
+            tmp_manuscript,
+            f"{base_filename}_orig.{input_type}"
+        )
+
+        ok_l, msg_l = False, "No PDF to upload"
+        if result["letter_pdf"]:
+            ok_l, msg_l = upload_to_remote_server(
+                tmp_letter_pdf,
+                f"{base_filename}_letter_{ts}.pdf"
+            )
+
+        if ok_m:
+            st.caption(f"✅ Manuscript uploaded to remote: `{msg_m}`")
+        else:
+            st.warning(f"⚠️ Could not upload manuscript to remote: {msg_m}")
+
+        if result["letter_pdf"]:
+            if ok_l:
+                st.caption(f"✅ Letter uploaded to remote: `{msg_l}`")
+            else:
+                st.warning(f"⚠️ Could not upload letter to remote: {msg_l}")
+
+    # --------------------------------------------------------
+    # Summary and diagnostics
+    # --------------------------------------------------------
     st.subheader("📊 Summary")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Paragraphs analyzed",
@@ -1074,7 +1083,6 @@ def main():
         st.info("No reformulation weaknesses were detected. The letter is "
                 "still generated, indicating that there are no suggestions.")
 
-    # --- Compilation diagnostics ---
     if result["corrections"]:
         with st.expander("Corrections applied to the letter"):
             for c in result["corrections"]:
@@ -1090,24 +1098,24 @@ def main():
             with st.expander("LaTeX log"):
                 st.code(result["letter_log"][-4000:], language="text")
 
-    # --- Save to debug/ (only the PDF) ---
-    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    # --------------------------------------------------------
+    # Local Save (debug) and Download (PDF only)
+    # --------------------------------------------------------
     if result["letter_pdf"]:
         try:
             pdf_path = os.path.join(DEBUG_DIR, f"letter_{ts}.pdf")
             with open(pdf_path, "wb") as f:
                 f.write(result["letter_pdf"])
-            st.caption(f"Letter saved to `{DEBUG_DIR}`.")
+            st.caption(f"Letter saved locally to `{DEBUG_DIR}`.")
         except Exception as e:
             st.warning(f"Could not save to debug/: {e}")
 
-    # --- Download (PDF only) ---
     st.subheader("⬇️ Download")
     if result["letter_pdf"]:
         st.download_button(
             "📕 Letter .pdf",
             data=result["letter_pdf"],
-            file_name=f"reformulation_letter_{ts}.pdf",
+            file_name=f"{base_filename}_letter_{ts}.pdf",
             mime="application/pdf",
             use_container_width=True,
         )
