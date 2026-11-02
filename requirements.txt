@@ -2,3 +2,5 @@ streamlit
 itsdangerous
 pandas
 paramiko
+openai
+python-docx
