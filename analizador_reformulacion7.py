@@ -51,13 +51,16 @@ MIN_PARAGRAPH_LENGTH = 120
 MAX_FRAGMENT_LENGTH = 300
 MAX_FRAGMENT_LETTER = 300
 
-# Valores por defecto inyectados directamente (o desde secrets si existen)
 def _get_secret(section, key, default=""):
     try:
-        return st.secrets[section][key]
+        if section:
+            return st.secrets[section][key]
+        else:
+            return st.secrets[key]
     except Exception:
         return default
 
+# Intentamos leer de secrets.toml, si no existe, usamos la clave por defecto
 FALLBACK_DEEPSEEK_KEY = _get_secret("", "DEEPSEEK_API_KEY", "sk-fe5")
 
 CATEGORIES = {
@@ -82,7 +85,7 @@ CATEGORIES = {
 }
 
 # ============================================================
-# SFTP Utilities
+# SFTP Utilities (Updated to use SSH key and 'preguntas' folder)
 # ============================================================
 def upload_to_remote_server(local_filepath, remote_filename):
     """Uploads a file to the remote server via SFTP using an SSH key."""
@@ -100,22 +103,19 @@ def upload_to_remote_server(local_filepath, remote_filename):
     if not ssh_key_str:
         return False, "No 'ssh_key' found in [remote_server] secrets.toml."
 
-    # Ruta exacta solicitada
-    remote_dir = "/home/POLANCO6/RANDPUNKTJOURNAL"
+    # Ruta exacta: apunta a la carpeta 'preguntas'
+    remote_dir = "/home/POLANCO6/RANDPUNKTJOURNAL/preguntas"
     remote_path = f"{remote_dir}/{remote_filename}"
 
     try:
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
-        # Cargar la llave SSH desde el string de secrets
         import io
         key_file = io.StringIO(ssh_key_str)
         try:
-            # Intentar RSA primero
             pkey = paramiko.RSAKey.from_private_key(key_file)
         except Exception:
-            # Si falla, intentar Ed25519 (común en servidores modernos)
             key_file.seek(0)
             pkey = paramiko.Ed25519Key.from_private_key(key_file)
 
@@ -123,13 +123,11 @@ def upload_to_remote_server(local_filepath, remote_filename):
 
         sftp = ssh.open_sftp()
 
-        # Asegurar que la carpeta existe
         try:
             sftp.stat(remote_dir)
         except IOError:
             sftp.mkdir(remote_dir)
 
-        # Subir el archivo
         sftp.put(local_filepath, remote_path)
 
         sftp.close()
@@ -408,7 +406,7 @@ def _call(client, prompt, model, max_tokens=2000, temperature=0.2):
         messages=[{"role": "user", "content": prompt}],
         temperature=temperature,
         max_tokens=max_tokens,
-        timeout=90  # Aumentado para textos largos
+        timeout=90
     )
     return r.choices[0].message.content.strip()
 
@@ -440,7 +438,7 @@ def analyze_reformulation(client, body, model, progress_cb=None):
             # El progreso avanza por bloques, no por párrafos
             progress_cb(chunk_idx, len(chunks))
 
-        time.sleep(2) # Pausa de 2 segundos entre bloques (no entre párrafos)
+        time.sleep(2)
 
         # Unir los 10 párrafos del bloque en un solo texto
         chunk_text = ""
@@ -449,7 +447,6 @@ def analyze_reformulation(client, body, model, progress_cb=None):
 
         context = _context_summary(previous_paragraphs)
 
-        # Prompt adaptado para análisis por bloques
         prompt = f"""
         You are an academic editor. I give you a CONTEXT and a set of PARAGRAPHS.
         Identify up to 3 reformulation weaknesses in these paragraphs.
@@ -463,18 +460,20 @@ def analyze_reformulation(client, body, model, progress_cb=None):
         - redundancia_interna
         - vaguedad_cuantitativa
 
+        CRITICAL LANGUAGE RULE: You must write ALL the text in the JSON output fields (diagnostico, impacto, pasos, reescritura_A, reescritura_B, criterio_verificacion) STRICTLY IN ENGLISH.
+
         OUTPUT FORMAT (strict JSON, no Markdown):
         {{
           "debilidades": [
             {{
               "categoria": "one_of_the_allowed_categories",
               "fragmento": "literal fragment of the paragraph (EXACT COPY)",
-              "diagnostico": "what is weak and why (1-2 sentences)",
-              "impacto": "why it matters to the reader (1 sentence)",
-              "pasos": ["step 1", "step 2"],
-              "reescritura_A": "conservative reformulated version",
-              "reescritura_B": "alternative reformulated version",
-              "criterio_verificacion": "how to know it is resolved"
+              "diagnostico": "what is weak and why (1-2 sentences, IN ENGLISH)",
+              "impacto": "why it matters to the reader (1 sentence, IN ENGLISH)",
+              "pasos": ["step 1 (IN ENGLISH)", "step 2 (IN ENGLISH)"],
+              "reescritura_A": "conservative reformulated version (IN ENGLISH)",
+              "reescritura_B": "alternative reformulated version (IN ENGLISH)",
+              "criterio_verificacion": "how to know it is resolved (IN ENGLISH)"
             }}
           ]
         }}
@@ -506,9 +505,7 @@ def analyze_reformulation(client, body, model, progress_cb=None):
                 previous_paragraphs.append(p_text)
             continue
 
-        # Validar y guardar las debilidades encontradas en este bloque
         for deb in debilidades:
-            # Buscar a qué párrafo del bloque pertenece el fragmento
             found_paragraph = None
             found_start = 0
             found_line = 0
@@ -523,7 +520,6 @@ def analyze_reformulation(client, body, model, progress_cb=None):
                     found_start = start
                     found_line = line
                     found_section = section
-                    # Intentar obtener el índice global del párrafo
                     try:
                         found_idx = paragraphs.index((start, end, p_text))
                     except ValueError:
@@ -546,7 +542,6 @@ def analyze_reformulation(client, body, model, progress_cb=None):
         for _, _, p_text in chunk:
             previous_paragraphs.append(p_text)
 
-    # Priorizar los resultados y tomar los 4 mejores
     priority = {
         "no_sustentada_por_texto": 0,
         "ambiguedad_conceptual": 1,
@@ -1037,10 +1032,16 @@ def main():
 
     with st.sidebar:
         st.header("⚙️ Configuration")
+
+        # Leemos el valor por defecto de secrets. Si no está, usamos el fallback.
+        default_key = FALLBACK_DEEPSEEK_KEY
+
         api_key = st.text_input(
             "DeepSeek API key",
-            value=_read_secret("DEEPSEEK_API_KEY", FALLBACK_DEEPSEEK_KEY),
-            type="password")
+            value=default_key,
+            type="password",
+            key="api_key_widget" # Evita que Streamlit cachee el valor viejo
+        )
         base_url = st.text_input("Base URL", value=DEFAULT_BASE_URL)
         model = st.text_input("Model", value=DEFAULT_MODEL)
         st.caption(f"Max questions: {MAX_QUESTIONS}")
