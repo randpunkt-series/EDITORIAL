@@ -751,12 +751,63 @@ def build_zenodo_metadata(submission):
         "communities": [{"identifier": community}],
     }
 
-def publish_to_zenodo_idempotent(articulo_id, submission_data, pdf_bytes, volume=None, issue=None, publication_date=None):
+# ============================================================
+# ZENODO — publicación idempotente (producción-ready)
+# ============================================================
+def _current_zenodo_env() -> str:
+    return "sandbox" if st.secrets.get("zenodo", {}).get("sandbox", False) else "production"
+
+
+def _zenodo_upload_with_retry(bucket_url: str, filename: str,
+                              pdf_bytes: bytes, token: str,
+                              max_retries: int = 3) -> tuple[bool, str]:
+    """Sube un PDF al bucket de Zenodo con reintentos ante 5xx/timeouts."""
+    upload_headers = {"Authorization": f"Bearer {token}"}
+    last_err = ""
+    for attempt in range(max_retries):
+        try:
+            pdf_stream = io.BytesIO(pdf_bytes)
+            r = requests.put(
+                f"{bucket_url}/{filename}",
+                headers=upload_headers,
+                data=pdf_stream,
+                timeout=300,
+            )
+            if 500 <= r.status_code < 600:
+                last_err = f"{r.status_code}: {r.text[:200]}"
+                time.sleep(2 ** attempt)
+                continue
+            if r.status_code >= 400:
+                return False, f"Error subiendo archivo a Zenodo ({r.status_code}): {r.text[:300]}"
+            return True, ""
+        except (requests.ConnectionError, requests.Timeout) as e:
+            last_err = str(e)
+            time.sleep(2 ** attempt)
+        except Exception as e:
+            return False, f"Error inesperado subiendo a Zenodo: {e}"
+    return False, f"Fallo tras {max_retries} intentos: {last_err}"
+
+
+def _refresh_bucket_url(api_url: str, dep_id: int, headers_json: dict) -> str:
+    """Obtiene un bucket_url fresco para el depósito (evita URLs caducadas)."""
+    r = _zenodo_request("GET", f"{api_url}/deposit/depositions/{dep_id}",
+                        headers=headers_json)
+    dep_info = r.json()
+    return dep_info.get("links", {}).get("bucket", "")
+
+
+def publish_to_zenodo_idempotent(articulo_id, submission_data, pdf_bytes,
+                                 volume=None, issue=None, publication_date=None):
     try:
         api_url, token = _zenodo_config()
         if not token:
             return False, "Zenodo token no configurado", ""
-        headers_json = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+        current_env = _current_zenodo_env()
+        headers_json = {"Authorization": f"Bearer {token}",
+                        "Content-Type": "application/json"}
+
+        # ---------- Inyectar volume / issue / fecha en submission_data ----------
         if volume is not None:
             submission_data["volume"] = volume
         if issue is not None:
@@ -770,8 +821,10 @@ def publish_to_zenodo_idempotent(articulo_id, submission_data, pdf_bytes, volume
             if im.get("volume") and im.get("issue"):
                 im["label"] = f"Volume {im['volume']}, Issue {im['issue']}"
             submission_data["issue_metadata"] = im
+
         metadata = build_zenodo_metadata(submission_data)
 
+        # ---------- Recuperar estado previo ----------
         zen = submission_data.get("zenodo")
         if not isinstance(zen, dict):
             zen = {}
@@ -779,52 +832,77 @@ def publish_to_zenodo_idempotent(articulo_id, submission_data, pdf_bytes, volume
 
         dep_id = zen.get("deposition_id")
 
+        # ---------- CORRECCIÓN 1: validar entorno del depósito guardado ----------
+        if dep_id and zen.get("environment") and zen["environment"] != current_env:
+            # El depósito pertenece a otro entorno (p. ej. sandbox → producción).
+            # No lo borramos (no tenemos permiso en el otro entorno desde aquí);
+            # simplemente lo olvidamos y creamos uno nuevo en el entorno actual.
+            append_log("ZENODO-ENV-RESET", articulo_id,
+                       f"Depósito {dep_id} era de {zen.get('environment')}; se ignora.")
+            dep_id = None
+            zen = {"environment": current_env}
+            submission_data["zenodo"] = zen
+
+        # ---------- Limpieza de depósito huérfano (solo mismo entorno) ----------
         if dep_id and not zen.get("published") and not zen.get("file_uploaded"):
             try:
-                _zenodo_request("DELETE", f"{api_url}/deposit/depositions/{dep_id}", headers=headers_json)
+                _zenodo_request("DELETE",
+                                f"{api_url}/deposit/depositions/{dep_id}",
+                                headers=headers_json)
             except Exception:
                 pass
             dep_id = None
-            zen = {}
+            zen = {"environment": current_env}
             submission_data["zenodo"] = zen
 
+        # ---------- Crear depósito si no existe ----------
         if not dep_id:
             r = _zenodo_request("POST", f"{api_url}/deposit/depositions",
-                                headers=headers_json, json_data={"metadata": metadata})
+                                headers=headers_json,
+                                json_data={"metadata": metadata})
             dep = r.json()
             if "id" not in dep or "links" not in dep:
                 return False, f"Respuesta inesperada de Zenodo: {str(dep)[:200]}", ""
             dep_id = dep["id"]
-            bucket_url = dep["links"]["bucket"]
             zen["deposition_id"] = dep_id
-            zen["bucket_url"] = bucket_url
-            zen["environment"] = "sandbox" if st.secrets.get("zenodo", {}).get("sandbox", False) else "production"
+            zen["bucket_url"] = dep["links"].get("bucket", "")
+            zen["environment"] = current_env
+            zen["created_at"] = datetime.now().isoformat(timespec="seconds")
             submission_data["zenodo"] = zen
             save_submission_json(articulo_id, submission_data)
-        else:
-            bucket_url = zen.get("bucket_url", "")
 
+        # ---------- CORRECCIÓN 4: refrescar bucket_url SIEMPRE antes de subir ----------
         if not zen.get("file_uploaded"):
+            bucket_url = _refresh_bucket_url(api_url, dep_id, headers_json)
             if not bucket_url:
-                r = _zenodo_request("GET", f"{api_url}/deposit/depositions/{dep_id}",
-                                    headers=headers_json)
-                dep_info = r.json()
-                bucket_url = dep_info.get("links", {}).get("bucket", "")
-                zen["bucket_url"] = bucket_url
-            filename = f"{articulo_id}.pdf"
+                return False, "Zenodo no devolvió bucket_url para el depósito.", ""
+            zen["bucket_url"] = bucket_url
+            submission_data["zenodo"] = zen
+            save_submission_json(articulo_id, submission_data)
+
+            # Validación del PDF antes de subir
             if not _is_valid_pdf(pdf_bytes):
                 return False, "El archivo no es un PDF válido.", ""
-            pdf_stream = io.BytesIO(pdf_bytes)
-            upload_headers = {"Authorization": f"Bearer {token}"}
-            r_upload = requests.put(f"{bucket_url}/{filename}", headers=upload_headers, data=pdf_stream, timeout=300)
-            if r_upload.status_code >= 400:
-                return False, f"Error subiendo archivo a Zenodo ({r_upload.status_code}): {r_upload.text}", ""
+
+            filename = f"{articulo_id}.pdf"
+            ok_upload, err_upload = _zenodo_upload_with_retry(
+                bucket_url, filename, pdf_bytes, token
+            )
+            if not ok_upload:
+                return False, err_upload, ""
+
             zen["file_uploaded"] = True
+            zen["uploaded_at"] = datetime.now().isoformat(timespec="seconds")
             submission_data["zenodo"] = zen
             save_submission_json(articulo_id, submission_data)
 
+        # ---------- Publicar ----------
         if not zen.get("published"):
-            r = _zenodo_request("POST", f"{api_url}/deposit/depositions/{dep_id}/actions/publish", headers=headers_json)
+            r = _zenodo_request(
+                "POST",
+                f"{api_url}/deposit/depositions/{dep_id}/actions/publish",
+                headers=headers_json,
+            )
             published = r.json()
             if "doi" not in published and "links" not in published:
                 return False, f"Error al publicar en Zenodo: {str(published)[:200]}", ""
@@ -832,10 +910,12 @@ def publish_to_zenodo_idempotent(articulo_id, submission_data, pdf_bytes, volume
             zen["url"] = published.get("links", {}).get("record_html", "")
             zen["published"] = True
             zen["published_at"] = datetime.now().isoformat(timespec="seconds")
+            zen["environment"] = current_env
             submission_data["zenodo"] = zen
             save_submission_json(articulo_id, submission_data)
 
         return True, zen.get("doi", ""), zen.get("url", "")
+
     except Exception as e:
         _log_error(f"publish_to_zenodo {articulo_id}", e)
         return False, str(e), ""
