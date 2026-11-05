@@ -1,5 +1,9 @@
 """
 RandPunkt — Editorial panel (reviewers.py) — Versión robusta final.
+Con mejoras:
+  - MEJORA 1: notificación al autor tras publicar en Zenodo.
+  - MEJORA 2: invalidación del PDF cacheado del issue.
+  - MEJORA 3: campos nativos journal_* en metadatos de Zenodo.
 """
 from __future__ import annotations
 
@@ -520,6 +524,162 @@ def enviar_correo_coautor(email_coautor, nombre_coautor, articulo_id,
     )
 
 # ============================================================
+# MEJORA 1: notificar al autor tras publicar en Zenodo
+# ============================================================
+def _notify_author_publication(articulo_id: str, submission: dict,
+                               volume: int, issue: int) -> bool:
+    """
+    Envía al autor correspondiente el aviso de publicación con DOI y URL.
+    No lanza excepción hacia arriba: si falla, solo se registra en log.
+    """
+    ca = submission.get("corresponding_author", {}) or {}
+    to_email = ca.get("email", "").strip()
+    if not to_email:
+        print(f"[NOTIFY] {articulo_id}: sin email del autor; se omite.")
+        return False
+
+    zen = submission.get("zenodo", {}) or {}
+    doi = zen.get("doi", "")
+    url = zen.get("url", "")
+    if not doi:
+        print(f"[NOTIFY] {articulo_id}: sin DOI; se omite correo.")
+        return False
+
+    published_at = submission.get("published_at") or datetime.now().strftime("%Y-%m-%d")
+    try:
+        published_date = datetime.fromisoformat(published_at).strftime("%Y-%m-%d")
+    except Exception:
+        published_date = published_at[:10] if len(published_at) >= 10 else published_at
+
+    base_url = st.secrets.get("app", {}).get("base_url", "https://randpunkt.org").rstrip("/")
+    article_page_url = f"{base_url}/articles/{articulo_id}"
+    version = submission.get("current_version", 1)
+    coauthors = submission.get("coauthors", []) or []
+    authors_full = ca.get("name", "")
+    if coauthors:
+        authors_full += ", " + ", ".join(
+            c if isinstance(c, str) else c.get("name", "") for c in coauthors
+        )
+    issue_line = f"Volume {volume}, Issue {issue}"
+    title = submission.get("titulo", "")
+
+    subject = f"[RandPunkt Journal] Article published — {articulo_id}"
+
+    text = f"""Dear {ca.get('name', 'Author')},
+
+We are pleased to inform you that your manuscript has been published in RandPunkt Journal.
+
+Title: {title}
+Authors: {authors_full}
+Volume/Issue: {issue_line}
+Published version: v{version}
+Publication date: {published_date}
+
+DOI: {doi}
+Zenodo record: {url}
+Article page: {article_page_url}
+
+Your article is now permanently available in open access under the Creative Commons Attribution 4.0 International (CC BY 4.0) license.
+
+You are invited to cite the article using the DOI provided above. If a preprint is available on arXiv, you may update it with this DOI to establish a permanent link between both versions.
+
+Thank you for your contribution to RandPunkt Journal.
+
+Sincerely,
+Editorial Team — RandPunkt Journal
+"""
+
+    html = f"""
+    <html>
+      <body style="font-family: Georgia, serif; color: #2c3e50; line-height: 1.6;">
+        <h2 style="color: #1e2a5a; border-bottom: 2px solid #b8b8b8;
+                   padding-bottom: 0.5rem;">Article published</h2>
+        <p>Dear {ca.get('name', 'Author')},</p>
+        <p>We are pleased to inform you that your manuscript has been published in <strong>RandPunkt Journal</strong>.</p>
+        <table style="border-collapse: collapse; margin: 1rem 0;">
+          <tr><td style="padding: 0.3rem 1rem 0.3rem 0;"><strong>Title:</strong></td>
+              <td style="padding: 0.3rem 0;">{title}</td></tr>
+          <tr><td style="padding: 0.3rem 1rem 0.3rem 0;"><strong>Authors:</strong></td>
+              <td style="padding: 0.3rem 0;">{authors_full}</td></tr>
+          <tr><td style="padding: 0.3rem 1rem 0.3rem 0;"><strong>Volume/Issue:</strong></td>
+              <td style="padding: 0.3rem 0;">{issue_line}</td></tr>
+          <tr><td style="padding: 0.3rem 1rem 0.3rem 0;"><strong>Published version:</strong></td>
+              <td style="padding: 0.3rem 0;">v{version}</td></tr>
+          <tr><td style="padding: 0.3rem 1rem 0.3rem 0;"><strong>Publication date:</strong></td>
+              <td style="padding: 0.3rem 0;">{published_date}</td></tr>
+        </table>
+        <div style="background: #f5f0e8; border-left: 4px solid #1e2a5a;
+                    padding: 1rem 1.2rem; margin: 1.5rem 0;">
+          <p style="margin: 0 0 0.5rem 0;"><strong>DOI:</strong></p>
+          <p style="margin: 0; font-family: monospace; font-size: 1.05rem;">
+            <a href="{url}" style="color: #1e2a5a;">{doi}</a>
+          </p>
+        </div>
+        <p>
+          <a href="{url}" style="color: #1e2a5a;">View on Zenodo</a> &middot;
+          <a href="{article_page_url}" style="color: #1e2a5a;">View on RandPunkt Journal</a>
+        </p>
+        <p>Your article is now permanently available in open access under the
+        <a href="https://creativecommons.org/licenses/by/4.0/" style="color: #1e2a5a;">
+        Creative Commons Attribution 4.0 International (CC BY 4.0)</a> license.</p>
+        <p>Thank you for your contribution to RandPunkt Journal.</p>
+        <p style="margin-top: 2rem;">Sincerely,<br>
+        <strong>Editorial Team</strong><br>
+        RandPunkt Journal</p>
+      </body>
+    </html>
+    """
+
+    # Envío: texto plano + HTML como alternativa (multipart/alternative)
+    try:
+        cfg = _smtp_config()
+        if not cfg["password"]:
+            print("[NOTIFY] SMTP no configurado; se omite correo al autor.")
+            return False
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"] = f"{cfg['name']} <{cfg['sender']}>"
+        msg["To"] = to_email
+        msg.attach(MIMEText(text, "plain", "utf-8"))
+        msg.attach(MIMEText(html, "html", "utf-8"))
+        s = smtplib.SMTP(cfg["server"], cfg["port"])
+        s.starttls()
+        s.login(cfg["sender"], cfg["password"])
+        s.send_message(msg)
+        s.quit()
+        print(f"[NOTIFY OK] publicación → {to_email}")
+        return True
+    except Exception as e:
+        _log_error(f"notify author {articulo_id}", e)
+        return False
+
+# ============================================================
+# MEJORA 2: invalidar el PDF cacheado del issue
+# ============================================================
+def _invalidate_issue_pdf_cache(volume: int, issue: int) -> bool:
+    """
+    Borra el PDF cacheado del issue en el servidor remoto para forzar
+    su regeneración la próxima vez que se solicite desde app.py.
+    No falla si el archivo no existe.
+    """
+    try:
+        transport, sftp = _sftp_connect()
+        base = _revista_base()
+        issue_pdf = f"{base}/ISSUES/RandPunkt_Vol{volume}_Issue{issue}.pdf"
+        try:
+            sftp.stat(issue_pdf)
+        except IOError:
+            sftp.close(); transport.close()
+            return False  # no existía; nada que borrar
+        sftp.remove(issue_pdf)
+        sftp.close(); transport.close()
+        append_log("ISSUE-PDF-INVALIDATE", "-", issue_pdf)
+        return True
+    except Exception as e:
+        _log_error("invalidate issue pdf", e)
+        return False
+
+# ============================================================
 # UPLOAD VERSION
 # ============================================================
 def upload_version(articulo_id, pdf_bytes, zip_bytes, pdf_name, zip_name, notas):
@@ -677,7 +837,7 @@ def import_from_revista():
         return 0, [f"Connection error: {e}"]
 
 # ============================================================
-# ZENODO
+# ZENODO — configuración y request con reintentos
 # ============================================================
 def _zenodo_config():
     zen = st.secrets.get("zenodo", {})
@@ -706,6 +866,9 @@ def _zenodo_request(method, url, *, headers=None, json_data=None, data=None,
             time.sleep(2 ** attempt)
     raise last_exc
 
+# ============================================================
+# MEJORA 3: build_zenodo_metadata con journal_* nativos
+# ============================================================
 def build_zenodo_metadata(submission):
     ca = submission.get("corresponding_author", {}) or {}
     authors = [{
@@ -737,11 +900,14 @@ def build_zenodo_metadata(submission):
     pub_date = submission.get("published_at") or datetime.now().strftime("%Y-%m-%d")
     if submission.get("volume") and submission.get("issue"):
         keywords.append(f"Volume {submission['volume']}, Issue {submission['issue']}")
+
     community = st.secrets.get("zenodo", {}).get("community", "randpunkt-journal")
-    return {
+    publication_type = tmap.get(submission.get("article_type"), "article")
+
+    zenodo_meta = {
         "title": submission.get("titulo", "Untitled"),
         "upload_type": "publication",
-        "publication_type": tmap.get(submission.get("article_type"), "article"),
+        "publication_type": publication_type,
         "publication_date": pub_date,
         "description": submission.get("abstract", ""),
         "creators": authors,
@@ -751,8 +917,21 @@ def build_zenodo_metadata(submission):
         "communities": [{"identifier": community}],
     }
 
+    # ============================================
+    # MEJORA 3: campos nativos de revista en Zenodo
+    # (solo para artículos, no para libros)
+    # ============================================
+    if publication_type == "article":
+        zenodo_meta["journal_title"] = "RandPunkt Journal"
+        if submission.get("volume") is not None:
+            zenodo_meta["journal_volume"] = str(submission["volume"])
+        if submission.get("issue") is not None:
+            zenodo_meta["journal_issue"] = str(submission["issue"])
+
+    return zenodo_meta
+
 # ============================================================
-# ZENODO — publicación idempotente (producción-ready)
+# ZENODO — helpers de publicación idempotente
 # ============================================================
 def _current_zenodo_env() -> str:
     return "sandbox" if st.secrets.get("zenodo", {}).get("sandbox", False) else "production"
@@ -795,7 +974,9 @@ def _refresh_bucket_url(api_url: str, dep_id: int, headers_json: dict) -> str:
     dep_info = r.json()
     return dep_info.get("links", {}).get("bucket", "")
 
-
+# ============================================================
+# ZENODO — publicación idempotente (producción-ready)
+# ============================================================
 def publish_to_zenodo_idempotent(articulo_id, submission_data, pdf_bytes,
                                  volume=None, issue=None, publication_date=None):
     try:
@@ -1450,11 +1631,28 @@ def tab_articles():
                                         save_articles(df_full)
 
                                         append_log("PUBLISH", aid, f"{env} DOI {doi_or_error}")
+
+                                        # ============================================
+                                        # MEJORA 1: notificar al autor (no bloqueante)
+                                        # ============================================
+                                        try:
+                                            _notify_author_publication(aid, sub, int(_vol), int(_iss))
+                                        except Exception as _e:
+                                            _log_error("notify author publication", _e)
+
+                                        # ============================================
+                                        # MEJORA 2: invalidar PDF cacheado del issue
+                                        # ============================================
+                                        try:
+                                            _invalidate_issue_pdf_cache(int(_vol), int(_iss))
+                                        except Exception as _e:
+                                            _log_error("invalidate issue pdf", _e)
+
                                         st.balloons()
                                         st.success(f"✅ Published on Zenodo ({env})! DOI: {doi_or_error}")
                                         st.rerun()
                                     else:
-                                        # CORRECCIÓN: Si falla Zenodo, NO cambiamos el estado local
+                                        # Si falla Zenodo, NO cambiamos el estado local
                                         st.error(f"❌ Error real de Zenodo: {doi_or_error}")
                     else:
                         st.caption("Only the Chief Editor can publish.")
@@ -1539,3 +1737,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
