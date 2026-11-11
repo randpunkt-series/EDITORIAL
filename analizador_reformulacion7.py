@@ -2,7 +2,8 @@
 r"""
 analizador_reformulacion.py — Streamlit standalone.
 
-Generates a LETTER to the author with up to 4 reformulation weaknesses.
+Generates a DIAGNOSTIC LETTER to the author with up to 4 reformulation
+weaknesses. It does NOT propose rewrites, steps, or verification criteria.
 """
 
 import os
@@ -55,9 +56,9 @@ MAX_QUESTIONS = 4
 MIN_PARAGRAPH_LENGTH = 120
 MAX_FRAGMENT_LENGTH = 300
 MAX_FRAGMENT_LETTER = 300
-MAX_UPLOAD_MB = 25                      # [FIX] límite de tamaño de archivo
-MAX_DEBUG_FILES = 50                    # [FIX] rotación de debug/
-MAX_TOKENS_BUDGET = 400_000             # [FIX] presupuesto de tokens por run
+MAX_UPLOAD_MB = 25
+MAX_DEBUG_FILES = 50
+MAX_TOKENS_BUDGET = 400_000
 
 def _get_secret(section, key, default=""):
     try:
@@ -68,7 +69,7 @@ def _get_secret(section, key, default=""):
     except Exception:
         return default
 
-# [FIX] Credenciales hardcodeadas intactas, según indicación del usuario.
+# Credenciales hardcodeadas intactas, según indicación del usuario.
 FALLBACK_DEEPSEEK_KEY = _get_secret("", "DEEPSEEK_API_KEY", "sk-fe5")
 
 CATEGORIES = {
@@ -93,7 +94,7 @@ CATEGORIES = {
 }
 
 # ============================================================
-# Logging estructurado (JSONL) # [FIX]
+# Logging estructurado (JSONL)
 # ============================================================
 def _setup_run_logger():
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -121,7 +122,6 @@ def _log(logger, **kwargs):
 
 
 def _rotate_debug_dir(max_files=MAX_DEBUG_FILES):
-    # [FIX] mantiene solo los últimos N .pdf y .jsonl en debug/
     try:
         entries = [
             os.path.join(DEBUG_DIR, f) for f in os.listdir(DEBUG_DIR)
@@ -141,7 +141,6 @@ def _rotate_debug_dir(max_files=MAX_DEBUG_FILES):
 # SFTP Utilities (SSH key + 'preguntas' folder)
 # ============================================================
 def _sanitize_filename(name):
-    # [FIX] evita path traversal y caracteres problemáticos
     base = os.path.basename(name or "")
     base = re.sub(r'[^A-Za-z0-9._-]', '_', base)
     base = base.lstrip(".-") or "file"
@@ -165,7 +164,7 @@ def upload_to_remote_server(local_filepath, remote_filename):
         return False, "No 'ssh_key' found in [remote_server] secrets.toml."
 
     remote_dir = "/home/POLANCO6/RANDPUNKTJOURNAL/preguntas"
-    safe_name = _sanitize_filename(remote_filename)          # [FIX]
+    safe_name = _sanitize_filename(remote_filename)
     remote_path = f"{remote_dir}/{safe_name}"
 
     try:
@@ -188,11 +187,10 @@ def upload_to_remote_server(local_filepath, remote_filename):
         except IOError:
             try:
                 sftp.mkdir(remote_dir)
-            except PermissionError as e:                     # [FIX]
+            except PermissionError as e:
                 sftp.close(); ssh.close()
                 return False, f"Cannot create remote dir (permissions): {e}"
 
-        # [FIX] timeout en la subida
         sftp.get_channel().settimeout(60)
         sftp.put(local_filepath, remote_path)
 
@@ -326,7 +324,7 @@ def _escape_plain_text(s):
 
 
 # ============================================================
-# Detection prompt (unificado) # [FIX]
+# Detection prompt — SOLO DIAGNÓSTICO (sin soluciones)
 # ============================================================
 PROMPT_DETECTION = r"""
 You are an academic editor expert in clarity and argumentative soundness.
@@ -350,10 +348,14 @@ FORBIDDEN:
 
 HARD RULE: if the only weakness requires new data, DO NOT flag it.
 
-CRITICAL LANGUAGE RULE: write ALL JSON text fields (diagnostico, impacto,
-pasos, reescritura_A, reescritura_B, criterio_verificacion) STRICTLY IN ENGLISH,
-regardless of the manuscript language. Do NOT include LaTeX commands in those
-fields; use plain text only.
+IMPORTANT: You must ONLY DIAGNOSE. Do NOT propose rewrites, implementation
+steps, verification criteria, or any kind of solution. Your output must
+describe what is wrong and why it matters, but leave the correction to the
+author.
+
+CRITICAL LANGUAGE RULE: write ALL JSON text fields (diagnostico, impacto)
+STRICTLY IN ENGLISH, regardless of the manuscript language. Do NOT include
+LaTeX commands in those fields; use plain text only.
 
 OUTPUT FORMAT (strict JSON, no Markdown):
 {
@@ -363,11 +365,7 @@ OUTPUT FORMAT (strict JSON, no Markdown):
       "categoria": "one_of_the_allowed_categories",
       "fragmento": "literal fragment of PARAGRAPH 3 (EXACT COPY, max 300 chars)",
       "diagnostico": "what is weak and why (1-2 sentences, IN ENGLISH)",
-      "impacto": "why it matters (1 sentence, IN ENGLISH)",
-      "pasos": ["step 1 (IN ENGLISH)", "step 2 (IN ENGLISH)"],
-      "reescritura_A": "conservative reformulated version (IN ENGLISH)",
-      "reescritura_B": "alternative reformulated version (IN ENGLISH)",
-      "criterio_verificacion": "how to know it is resolved (IN ENGLISH)"
+      "impacto": "why it matters (1 sentence, IN ENGLISH)"
     }
   ]
 }
@@ -382,7 +380,7 @@ PARAGRAPHS:
 
 
 # ============================================================
-# Post-filter: discard weaknesses that ask for new data # [FIX]
+# Post-filter: discard weaknesses that ask for new data
 # ============================================================
 _NEW_DATA_PATTERNS = [
     # English
@@ -393,7 +391,7 @@ _NEW_DATA_PATTERNS = [
     r'\bnew data\b', r'\bsurvey(s)?\b',
     r'\bcite\b', r'\bbibliographic reference(s)?\b',
     r'\bbibliography\b', r'\bdoi\b',
-    # Spanish (bilingual hardening)
+    # Spanish
     r'\bexperimento(s)?\b', r'\bmedici[oó]n(es)?\b', r'\bmedir\b',
     r'\bvalidar con datos\b', r'\bdatos reales\b',
     r'\bcomparar con datos\b', r'\breportar error\b',
@@ -407,6 +405,15 @@ _EXISTING_CITATION_PATTERNS = [
     r'\\cite[a-zA-Z]*\s*\{',
 ]
 
+# [FIX] Detectar si el LLM intentó proponer soluciones (para descartar)
+_SOLUTION_PATTERNS = [
+    r'\brewrite\b', r'\breescrib', r'\brephrase\b', r'\breformul',
+    r'\bwe suggest\b', r'\byou should\b', r'\bconsider\b',
+    r'\bsteps?\b', r'\bpasos?\b', r'\bfix\b', r'\bcorrection\b',
+    r'\bcorrecci[oó]n\b', r'\bverification\b', r'\bverificaci[oó]n\b',
+    r'\bcriterion\b', r'\bcriterio\b',
+]
+
 
 def _asks_for_new_data(text):
     t = (text or "").lower()
@@ -418,7 +425,6 @@ def _already_has_citation(fragment):
 
 
 def _looks_english(text, threshold=0.6):
-    # [FIX] heurística mínima de idioma (sin dependencias externas)
     if not text or len(text) < 20:
         return True
     en = len(re.findall(
@@ -433,8 +439,13 @@ def _looks_english(text, threshold=0.6):
     return (en / total) >= threshold
 
 
+def _looks_like_solution(text):
+    # [FIX] descarta debilidades cuyo diagnóstico/intención sea proponer solución
+    t = (text or "").lower()
+    return any(re.search(p, t) for p in _SOLUTION_PATTERNS)
+
+
 def _fuzzy_match(fragment, paragraph, threshold=0.95):
-    # [FIX] matching robusto: primero exacto, luego ratio ≥ threshold
     frag_norm = _clean_for_comparison(fragment)
     parr_norm = _clean_for_comparison(paragraph)
     if not frag_norm:
@@ -463,45 +474,46 @@ def validate_weakness(deb, paragraph):
     if not frag or len(frag) < 20:
         return False, "empty or too short fragment"
 
-    if not _fuzzy_match(frag, paragraph):                    # [FIX]
+    if not _fuzzy_match(frag, paragraph):
         return False, "fragment does not appear in the paragraph (fuzzy<0.95)"
 
     if _already_has_citation(frag):
         if cat == "no_sustentada_por_texto":
             return False, "the fragment already contains \\cite"
 
-    reformulation_text = " ".join([
+    diagnostic_text = " ".join([
         deb.get("diagnostico", ""),
         deb.get("impacto", ""),
-        " ".join(deb.get("pasos", []) or []),
-        deb.get("reescritura_A", ""),
-        deb.get("reescritura_B", ""),
-        deb.get("criterio_verificacion", ""),
     ])
-    if _asks_for_new_data(reformulation_text):
-        return False, "the proposed reformulation requires new data"
+    if _asks_for_new_data(diagnostic_text):
+        return False, "the diagnosis requires new data"
 
-    # [FIX] verificación de idioma inglés en campos del LLM
-    if not _looks_english(reformulation_text):
+    # [FIX] rechazar si el LLM intentó proponer solución
+    if _looks_like_solution(diagnostic_text):
+        return False, "diagnosis contains solution-like language"
+
+    # [FIX] verificación de idioma inglés
+    if not _looks_english(diagnostic_text):
         return False, "LLM output is not in English"
 
-    deb["pasos"] = [p for p in (deb.get("pasos") or []) if p and p.strip()]
-    if len(deb["pasos"]) < 2:
-        return False, "fewer than 2 implementation steps"
-
-    for k in ("diagnostico", "impacto", "reescritura_A",
-              "reescritura_B", "criterio_verificacion"):
+    # [FIX] solo se exigen los campos de diagnóstico
+    for k in ("diagnostico", "impacto"):
         if not deb.get(k):
             return False, f"empty field: {k}"
 
     if len(frag) > MAX_FRAGMENT_LENGTH * 2:
         deb["fragmento"] = frag[:MAX_FRAGMENT_LENGTH] + "..."
 
+    # [FIX] eliminar campos de solución si el LLM los devolvió por error
+    for k in ("pasos", "reescritura_A", "reescritura_B",
+              "criterio_verificacion"):
+        deb.pop(k, None)
+
     return True, ""
 
 
 # ============================================================
-# LLM (con retries, backoff y tracking de tokens) # [FIX]
+# LLM (retries, backoff, tokens)
 # ============================================================
 class _TokenTracker:
     def __init__(self, budget=MAX_TOKENS_BUDGET):
@@ -545,7 +557,6 @@ def _call(client, prompt, model, max_tokens=2000, temperature=0.2,
         except Exception as e:
             last_err = e
             msg = str(e).lower()
-            # Reintentar en rate limit / server errors / timeouts
             if any(k in msg for k in ("429", "rate", "503", "502", "504",
                                        "timeout", "timed out", "overloaded")):
                 if attempt < max_retries - 1:
@@ -566,14 +577,15 @@ def _context_summary(previous_paragraphs, max_chars=1200):
 
 
 # ============================================================
-# Main analysis (chunked + paragraph_id explícito) # [FIX]
+# Main analysis (chunked + paragraph_id explícito)
 # ============================================================
 def analyze_reformulation(client, body, model, progress_cb=None,
                           logger=None, cancel_event=None):
     paragraphs = split_paragraphs(body)
     results = []
     rejections = {"llm_empty": 0, "validation": 0, "new_data": 0,
-                  "not_english": 0, "bad_paragraph_id": 0}
+                  "not_english": 0, "bad_paragraph_id": 0,
+                  "solution_like": 0}  # [FIX]
     previous_paragraphs = []
     tracker = _TokenTracker()
 
@@ -588,7 +600,6 @@ def analyze_reformulation(client, body, model, progress_cb=None,
         if progress_cb:
             progress_cb(chunk_idx, len(chunks))
 
-        # Backoff ya manejado dentro de _call; este sleep es cortés
         time.sleep(1.5)
 
         chunk_text = ""
@@ -599,7 +610,7 @@ def analyze_reformulation(client, body, model, progress_cb=None,
         prompt = PROMPT_DETECTION.replace("{contexto}", context) \
                                  .replace("{parrafos}", chunk_text)
 
-        raw, err = _call(client, prompt, model, max_tokens=3000,
+        raw, err = _call(client, prompt, model, max_tokens=2000,
                          temperature=0.2, tracker=tracker)
         if raw is None:
             st.error(f"❌ Block {chunk_idx+1} failed after retries: {err}")
@@ -645,13 +656,14 @@ def analyze_reformulation(client, body, model, progress_cb=None,
                     rejections["new_data"] += 1
                 if "not in English" in reason:
                     rejections["not_english"] += 1
+                if "solution-like" in reason:
+                    rejections["solution_like"] += 1
                 _log(logger, event="rejected", chunk=chunk_idx + 1,
                      pid=pid, categoria=deb.get("categoria"),
                      reason=reason)
                 continue
 
             section, line = locate_section(body, start)
-            # [FIX] índice global correcto (sin depender de .index())
             global_idx = paragraphs.index((start, end, p_text))
             results.append({
                 "paragraph_idx": global_idx,
@@ -671,7 +683,6 @@ def analyze_reformulation(client, body, model, progress_cb=None,
                 f"{tracker.budget}) — stopping early.")
             break
 
-    # [FIX] diversificación antes de truncar
     priority = {
         "no_sustentada_por_texto": 0,
         "ambiguedad_conceptual": 1,
@@ -712,7 +723,7 @@ def analyze_reformulation(client, body, model, progress_cb=None,
 
 
 # ============================================================
-# LaTeX letter — centered logo + watermark + English
+# LaTeX letter — SOLO diagnóstico (sin soluciones)
 # ============================================================
 def generate_latex_letter(stats, results, manuscript_name="manuscript.tex",
                           logo_available=LOGO_DISPONIBLE):
@@ -754,7 +765,7 @@ def generate_latex_letter(stats, results, manuscript_name="manuscript.tex",
 \usepackage{hyperref}
 \hypersetup{colorlinks=true, linkcolor=blue, urlcolor=blue}
 """ + preamble_extra + r"""
-\title{\textbf{Reformulation Letter}\\[4pt]
+\title{\textbf{Reformulation Diagnostic Letter}\\[4pt]
 \large Pedagogical report for the author}
 \author{Reformulation Analyzer}
 \date{""" + date + r"""}
@@ -777,6 +788,10 @@ weaknesses in the manuscript. These are problems that are solved by
 \emph{rewriting} the text, without the need for new experiments, data,
 measurements, or citations.
 
+\textbf{This letter is purely diagnostic: it identifies and explains the
+weaknesses, but does not propose rewrites, implementation steps, or
+verification criteria. The correction is left entirely to the author.}
+
 \vspace{6pt}
 \noindent
 \textbf{Total paragraphs:} """ + str(stats.get('total_paragraphs', 0)) + r""" \quad
@@ -792,7 +807,7 @@ The categories considered are:
                  + _escape_latex(desc) + "\n")
     L.append(r"\end{itemize}" + "\n")
 
-    L.append(r"\section*{2. Reformulation questions}" + "\n")
+    L.append(r"\section*{2. Identified weaknesses}" + "\n")
 
     if not results:
         L.append(r"""\noindent
@@ -810,7 +825,7 @@ solely by rewriting.
                 r_.get('section', '(no section)'))
 
             L.append(r"\noindent\rule{\textwidth}{0.2pt}" + "\n")
-            L.append(r"\noindent\textbf{Question " + str(i) + r"} "
+            L.append(r"\noindent\textbf{Weakness " + str(i) + r"} "
                      r"\textnormal{(Section: "
                      + section_safe
                      + r", paragraph " + str(r_['paragraph_idx'] + 1)
@@ -824,24 +839,10 @@ solely by rewriting.
                          + _escape_plain_text(fragment_plain)
                          + r"''}" + "\n\n")
 
-            # [FIX] escapado de TODOS los campos del LLM
             L.append(r"\noindent\textbf{Diagnosis:} "
                      + _escape_latex(d['diagnostico']) + "\n\n")
             L.append(r"\noindent\textbf{Impact:} "
                      + _escape_latex(d['impacto']) + "\n\n")
-
-            L.append(r"\noindent\textbf{Implementation steps:}" + "\n")
-            L.append(r"\begin{enumerate}[leftmargin=*]" + "\n")
-            for p in d["pasos"]:
-                L.append(r"\item " + _escape_latex(p) + "\n")
-            L.append(r"\end{enumerate}" + "\n\n")
-
-            L.append(r"\noindent\textbf{Rewrite A (conservative):} "
-                     + _escape_latex(d['reescritura_A']) + "\n\n")
-            L.append(r"\noindent\textbf{Rewrite B (alternative):} "
-                     + _escape_latex(d['reescritura_B']) + "\n\n")
-            L.append(r"\noindent\textbf{Verification criterion:} "
-                     + _escape_latex(d['criterio_verificacion']) + "\n\n")
 
         L.append(r"\noindent\rule{\textwidth}{0.2pt}" + "\n\n")
 
@@ -849,22 +850,25 @@ solely by rewriting.
 \section*{3. How to use this letter}
 
 \begin{enumerate}[leftmargin=*]
-    \item For each question, locate the fragment in your manuscript
+    \item For each weakness, locate the fragment in your manuscript
           (it appears in plain text between quotes, without LaTeX code).
-    \item Choose rewrite A or B, or combine them.
-    \item Apply the implementation steps if the rewrite is not enough.
-    \item Verify the criterion before considering the question resolved.
-    \item If the rewrite does not fit your argument, discard the
-          suggestion: the final decision is yours.
+    \item Read the diagnosis and the impact to understand what is weak
+          and why it matters.
+    \item Decide yourself how to reformulate the text; this letter does
+          not propose rewrites or steps.
+    \item If the weakness does not fit your argument, discard the
+          observation: the final decision is yours.
 \end{enumerate}
 
 \section*{4. Methodological notice}
 
-This report identifies \textbf{reformulation} weaknesses (clarity, scope,
-structure, redundancy, vagueness). It does not detect plagiarism, does not
-compute AI writing, does not search for citations, does not validate
-bibliography, and does not propose new experiments. The final decision is
-the author's responsibility.
+This report \textbf{only diagnoses} reformulation weaknesses (clarity,
+scope, structure, redundancy, vagueness). It does not propose rewrites,
+does not suggest implementation steps, does not provide verification
+criteria, does not detect plagiarism, does not compute AI writing, does
+not search for citations, does not validate bibliography, and does not
+propose new experiments. The final decision is the author's
+responsibility.
 
 \vspace{12pt}
 \noindent\rule{\textwidth}{0.4pt}
@@ -901,8 +905,6 @@ def compile_latex(tex_str, timeout=60, engine="pdflatex", logo_path=None):
         with open(tex_path, "w", encoding="utf-8", newline="\n") as f:
             f.write(tex_str)
 
-        # [FIX] copia el logo si existe en el sistema, independientemente
-        # de si el string lo referencia (evita fallos de includegraphics)
         if "randpunkt-logo.pdf" in tex_str:
             src = logo_path or LOGO_PATH
             if os.path.isfile(src) and os.path.getsize(src) > 0:
@@ -919,7 +921,7 @@ def compile_latex(tex_str, timeout=60, engine="pdflatex", logo_path=None):
 
         log_total = []
         r = None
-        for _ in range(2):  # two passes for \ref
+        for _ in range(2):
             try:
                 r = subprocess.run(
                     [engine, "-interaction=nonstopmode",
@@ -960,9 +962,6 @@ def compile_latex(tex_str, timeout=60, engine="pdflatex", logo_path=None):
         return ok, "\n".join(log_total), pdf_bytes
 
 
-# ------------------------------------------------------------
-# Auto-correction rules
-# ------------------------------------------------------------
 _AUTOFIX_RULES = [
     (re.compile(r'\\textbackslash\{\}((?:[a-zA-Z]+))'), r'\\\1'),
     (re.compile(r'\\textbackslash\{\}\{'), r'{'),
@@ -980,7 +979,6 @@ _AUTOFIX_RULES = [
 
 
 def _fix_underscores_outside_math(tex):
-    # [FIX] ignora \$ (dólar literal) al contar delimitadores
     out = []
     for line in tex.splitlines(keepends=True):
         dollars = len(re.findall(r'(?<!\\)\$', line))
@@ -1190,12 +1188,11 @@ def _sidebar_has_remote_config():
 
 def main():
     st.set_page_config(
-        page_title="Reformulation Letter",
-        page_icon="✍️",
+        page_title="Reformulation Diagnostic Letter",
+        page_icon="🔍",
         layout="wide",
     )
 
-    # [FIX] estado de cancelación
     if "cancel_event" not in st.session_state:
         import threading
         st.session_state.cancel_event = threading.Event()
@@ -1204,19 +1201,19 @@ def main():
     if "run_meta" not in st.session_state:
         st.session_state.run_meta = None
 
-    st.title("✍️ Reformulation Letter")
+    st.title("🔍 Reformulation Diagnostic Letter")
     st.caption(
-        "Upload your manuscript (.tex or .docx). The program detects up to 4 "
-        "reformulation weaknesses and generates a **letter** for the author "
-        "with diagnosis, steps, A/B rewrites, and a verification criterion. "
-        "The letter is compiled with LaTeX (pdflatex/lualatex/xelatex) and "
-        "auto-corrected if there are typesetting errors. The manuscript "
-        "fragment is quoted in **plain text**, so no broken LaTeX is dragged in.")
+        "Upload your manuscript (.tex or .docx). The program **detects** up to 4 "
+        "reformulation weaknesses and generates a **diagnostic letter** for the "
+        "author with the category, the fragment, a diagnosis, and the impact. "
+        "**It does not propose rewrites, steps, or verification criteria**: the "
+        "correction is left to the author. The letter is compiled with LaTeX "
+        "(pdflatex/lualatex/xelatex) and auto-corrected if there are "
+        "typesetting errors.")
 
     with st.sidebar:
         st.header("⚙️ Configuration")
 
-        # [FIX] st.form evita reejecuciones en cada cambio
         with st.form("config_form"):
             default_key = FALLBACK_DEEPSEEK_KEY
             api_key = st.text_input(
@@ -1229,7 +1226,7 @@ def main():
             model = st.text_input("Model", value=DEFAULT_MODEL)
             st.form_submit_button("Apply")
 
-        st.caption(f"Max questions: {MAX_QUESTIONS}")
+        st.caption(f"Max weaknesses: {MAX_QUESTIONS}")
 
         engines_ok = [e for e in ("pdflatex", "lualatex", "xelatex")
                       if _latex_engine_available(e)]
@@ -1244,7 +1241,6 @@ def main():
             st.caption("ℹ️ Logo not found (`randpunkt-logo.pdf`). "
                        "The letter will be generated without a logo.")
 
-        # [FIX] aviso temprano si falta configuración SFTP
         if not _sidebar_has_remote_config():
             st.caption("ℹ️ `[remote_server]` not configured: remote backup "
                        "disabled.")
@@ -1257,7 +1253,6 @@ def main():
         st.info("Upload a .tex or .docx file to begin.")
         return
 
-    # [FIX] límite de tamaño
     if uploaded.size > MAX_UPLOAD_MB * 1024 * 1024:
         st.error(f"File too large ({uploaded.size/1024/1024:.1f} MB). "
                  f"Maximum is {MAX_UPLOAD_MB} MB.")
@@ -1272,7 +1267,6 @@ def main():
     st.success(f"File loaded: **{name}** "
                f"({input_type}, {len(body_text)} characters).")
 
-    # [FIX] vista previa del manuscrito
     with st.expander("Preview detected paragraphs"):
         preview_paras = split_paragraphs(body_text)
         st.caption(f"{len(preview_paras)} paragraphs meet the minimum "
@@ -1289,7 +1283,7 @@ def main():
         return
 
     col_btn, col_cancel = st.columns([1, 1])
-    if col_btn.button("▶️ Generate letter", type="primary"):
+    if col_btn.button("▶️ Generate diagnostic letter", type="primary"):
         st.session_state.cancel_event = __import__("threading").Event()
         st.session_state.run_result = None
 
@@ -1341,11 +1335,8 @@ def main():
     if result["error"]:
         st.error(f"Error: {result['error']}")
         return
-    st.success("Letter generated.")
+    st.success("Diagnostic letter generated.")
 
-    # --------------------------------------------------------
-    # Summary and diagnostics
-    # --------------------------------------------------------
     st.subheader("📊 Summary")
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Paragraphs analyzed",
@@ -1359,9 +1350,8 @@ def main():
 
     if not result["results"]:
         st.info("No reformulation weaknesses were detected. The letter is "
-                "still generated, indicating that there are no suggestions.")
+                "still generated, indicating that there are no observations.")
 
-    # [FIX] mostrar rechazos (diagnóstico)
     rej = result["stats"].get("rejections", {}) or {}
     if rej:
         with st.expander("Rejection stats"):
@@ -1382,9 +1372,6 @@ def main():
             with st.expander("LaTeX log"):
                 st.code(result["letter_log"][-4000:], language="text")
 
-    # --------------------------------------------------------
-    # Local Save (debug) with rotation # [FIX]
-    # --------------------------------------------------------
     if result["letter_pdf"]:
         try:
             pdf_path = os.path.join(DEBUG_DIR, f"letter_{ts}.pdf")
@@ -1395,9 +1382,6 @@ def main():
         except Exception as e:
             st.warning(f"Could not save to debug/: {e}")
 
-    # --------------------------------------------------------
-    # Downloads (PDF + .tex + .json) # [FIX]
-    # --------------------------------------------------------
     st.subheader("⬇️ Download")
     base_filename = _sanitize_filename(os.path.splitext(name)[0])
 
@@ -1405,7 +1389,7 @@ def main():
     with dl1:
         if result["letter_pdf"]:
             st.download_button(
-                "📕 Letter .pdf",
+                "📕 Diagnostic letter .pdf",
                 data=result["letter_pdf"],
                 file_name=f"{base_filename}_letter_{ts}.pdf",
                 mime="application/pdf",
@@ -1417,7 +1401,7 @@ def main():
     with dl2:
         if result["letter_tex"]:
             st.download_button(
-                "📄 Letter .tex",
+                "📄 Diagnostic letter .tex",
                 data=result["letter_tex"].encode("utf-8"),
                 file_name=f"{base_filename}_letter_{ts}.tex",
                 mime="application/x-tex",
@@ -1430,7 +1414,7 @@ def main():
                 {"stats": result["stats"], "results": result["results"]},
                 ensure_ascii=False, indent=2, default=str).encode("utf-8")
             st.download_button(
-                "🧾 Results .json",
+                "🧾 Diagnostics .json",
                 data=payload,
                 file_name=f"{base_filename}_results_{ts}.json",
                 mime="application/json",
@@ -1439,13 +1423,10 @@ def main():
         except Exception:
             pass
 
-    # --------------------------------------------------------
-    # Remote upload (explicit action, AFTER showing result) # [FIX]
-    # --------------------------------------------------------
     if _sidebar_has_remote_config():
         st.subheader("☁️ Remote backup")
         st.caption("Uploads the original manuscript and (if available) the "
-                   "letter PDF to the configured SFTP server.")
+                   "diagnostic letter PDF to the configured SFTP server.")
         if st.button("Upload to remote server"):
             tmp_dir = tempfile.mkdtemp(prefix="rp_")
             try:
