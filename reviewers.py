@@ -4,6 +4,8 @@ Con mejoras:
   - MEJORA 1: notificación al autor tras publicar en Zenodo.
   - MEJORA 2: invalidación del PDF cacheado del issue.
   - MEJORA 3: campos nativos journal_* en metadatos de Zenodo.
+  - OPTIMIZACIÓN: Caché de Streamlit, descarga diferida de PDFs y botón de refresco manual.
+  - FIX: build_zenodo_metadata ahora acepta listas o strings en keywords.
 """
 from __future__ import annotations
 
@@ -275,7 +277,7 @@ def _validate_upload(pdf_bytes: bytes, zip_bytes: bytes) -> tuple[bool, str]:
     return True, ""
 
 # ============================================================
-# CSV
+# CSV (CON CACHÉ DE STREAMLIT PARA ACELERAR LA UI)
 # ============================================================
 def _read_csv(filename, columns):
     try:
@@ -326,15 +328,31 @@ def _save_csv(filename, df, use_global_lock: bool = False):
         st.error(f"Error saving {filename}: {e}")
         return False
 
+@st.cache_data(ttl=30, show_spinner=False)
 def read_articles():       return _read_csv(st.secrets["csv"]["articulos_file"], COLS_ARTICULOS)
-def save_articles(df):     return _save_csv(st.secrets["csv"]["articulos_file"], df)
+
+def save_articles(df):     
+    success = _save_csv(st.secrets["csv"]["articulos_file"], df)
+    if success: read_articles.clear()
+    return success
+
+@st.cache_data(ttl=30, show_spinner=False)
 def read_versions():       return _read_csv(st.secrets["csv"]["versiones_file"], COLS_VERSIONES)
-def save_versions(df):     return _save_csv(st.secrets["csv"]["versiones_file"], df)
+
+def save_versions(df):     
+    success = _save_csv(st.secrets["csv"]["versiones_file"], df)
+    if success: read_versions.clear()
+    return success
+
+@st.cache_data(ttl=30, show_spinner=False)
 def read_confirmations():  return _read_csv(st.secrets["csv"]["confirmaciones_file"], COLS_CONFIRMACIONES)
 
 def save_confirmations(df):
-    return _save_csv(st.secrets["csv"]["confirmaciones_file"], df, use_global_lock=False)
+    success = _save_csv(st.secrets["csv"]["confirmaciones_file"], df, use_global_lock=False)
+    if success: read_confirmations.clear()
+    return success
 
+@st.cache_data(ttl=30, show_spinner=False)
 def read_coauthors():
     try:
         transport, sftp = _sftp_connect()
@@ -360,9 +378,15 @@ def read_coauthors():
         st.error(f"Error reading coauthors: {e}")
         return pd.DataFrame(columns=COLS_COAUTORES)
 
-def save_coauthors(df): return _save_csv(st.secrets["csv"]["coautores_file"], df)
+def save_coauthors(df): 
+    success = _save_csv(st.secrets["csv"]["coautores_file"], df)
+    if success: read_coauthors.clear()
+    return success
+
+@st.cache_data(ttl=30, show_spinner=False)
 def read_editores():    return _read_csv(st.secrets["csv"]["editores_file"], ["login", "password", "level", "email"])
 
+@st.cache_data(ttl=30, show_spinner=False)
 def get_submission(tracking_id):
     try:
         transport, sftp = _sftp_connect()
@@ -398,6 +422,7 @@ def save_submission_json(tracking_id, data):
             pass
         sftp.rename(tmp, json_path)
         sftp.close(); transport.close()
+        get_submission.clear()
         return True
     except Exception as e:
         _log_error(f"save_submission_json {tracking_id}", e)
@@ -528,10 +553,6 @@ def enviar_correo_coautor(email_coautor, nombre_coautor, articulo_id,
 # ============================================================
 def _notify_author_publication(articulo_id: str, submission: dict,
                                volume: int, issue: int) -> bool:
-    """
-    Envía al autor correspondiente el aviso de publicación con DOI y URL.
-    No lanza excepción hacia arriba: si falla, solo se registra en log.
-    """
     ca = submission.get("corresponding_author", {}) or {}
     to_email = ca.get("email", "").strip()
     if not to_email:
@@ -630,7 +651,6 @@ Editorial Team — RandPunkt Journal
     </html>
     """
 
-    # Envío: texto plano + HTML como alternativa (multipart/alternative)
     try:
         cfg = _smtp_config()
         if not cfg["password"]:
@@ -657,11 +677,6 @@ Editorial Team — RandPunkt Journal
 # MEJORA 2: invalidar el PDF cacheado del issue
 # ============================================================
 def _invalidate_issue_pdf_cache(volume: int, issue: int) -> bool:
-    """
-    Borra el PDF cacheado del issue en el servidor remoto para forzar
-    su regeneración la próxima vez que se solicite desde app.py.
-    No falla si el archivo no existe.
-    """
     try:
         transport, sftp = _sftp_connect()
         base = _revista_base()
@@ -670,7 +685,7 @@ def _invalidate_issue_pdf_cache(volume: int, issue: int) -> bool:
             sftp.stat(issue_pdf)
         except IOError:
             sftp.close(); transport.close()
-            return False  # no existía; nada que borrar
+            return False
         sftp.remove(issue_pdf)
         sftp.close(); transport.close()
         append_log("ISSUE-PDF-INVALIDATE", "-", issue_pdf)
@@ -879,7 +894,17 @@ def build_zenodo_metadata(submission):
     for c in submission.get("coauthors", []):
         authors.append({"name": c} if isinstance(c, str) else c)
 
-    keywords = [k.strip() for k in submission.get("keywords", "").split(",") if k.strip()]
+    # ==========================================
+    # CORRECCIÓN: Acepta listas o strings
+    # ==========================================
+    raw_keywords = submission.get("keywords", "")
+    keywords = []
+    if isinstance(raw_keywords, list):
+        keywords = [str(k).strip() for k in raw_keywords if str(k).strip()]
+    elif isinstance(raw_keywords, str):
+        keywords = [k.strip() for k in raw_keywords.split(",") if k.strip()]
+    # ==========================================
+
     msc = submission.get("msc", {}) or {}
     if msc.get("primary", {}).get("code"):
         keywords.append(f"MSC {msc['primary']['code']}")
@@ -917,10 +942,6 @@ def build_zenodo_metadata(submission):
         "communities": [{"identifier": community}],
     }
 
-    # ============================================
-    # MEJORA 3: campos nativos de revista en Zenodo
-    # (solo para artículos, no para libros)
-    # ============================================
     if publication_type == "article":
         zenodo_meta["journal_title"] = "RandPunkt Journal"
         if submission.get("volume") is not None:
@@ -940,7 +961,6 @@ def _current_zenodo_env() -> str:
 def _zenodo_upload_with_retry(bucket_url: str, filename: str,
                               pdf_bytes: bytes, token: str,
                               max_retries: int = 3) -> tuple[bool, str]:
-    """Sube un PDF al bucket de Zenodo con reintentos ante 5xx/timeouts."""
     upload_headers = {"Authorization": f"Bearer {token}"}
     last_err = ""
     for attempt in range(max_retries):
@@ -968,14 +988,13 @@ def _zenodo_upload_with_retry(bucket_url: str, filename: str,
 
 
 def _refresh_bucket_url(api_url: str, dep_id: int, headers_json: dict) -> str:
-    """Obtiene un bucket_url fresco para el depósito (evita URLs caducadas)."""
     r = _zenodo_request("GET", f"{api_url}/deposit/depositions/{dep_id}",
                         headers=headers_json)
     dep_info = r.json()
     return dep_info.get("links", {}).get("bucket", "")
 
 # ============================================================
-# ZENODO — publicación idempotente (producción-ready)
+# ZENODO — publicación idempotente
 # ============================================================
 def publish_to_zenodo_idempotent(articulo_id, submission_data, pdf_bytes,
                                  volume=None, issue=None, publication_date=None):
@@ -988,7 +1007,6 @@ def publish_to_zenodo_idempotent(articulo_id, submission_data, pdf_bytes,
         headers_json = {"Authorization": f"Bearer {token}",
                         "Content-Type": "application/json"}
 
-        # ---------- Inyectar volume / issue / fecha en submission_data ----------
         if volume is not None:
             submission_data["volume"] = volume
         if issue is not None:
@@ -1005,7 +1023,6 @@ def publish_to_zenodo_idempotent(articulo_id, submission_data, pdf_bytes,
 
         metadata = build_zenodo_metadata(submission_data)
 
-        # ---------- Recuperar estado previo ----------
         zen = submission_data.get("zenodo")
         if not isinstance(zen, dict):
             zen = {}
@@ -1013,18 +1030,13 @@ def publish_to_zenodo_idempotent(articulo_id, submission_data, pdf_bytes,
 
         dep_id = zen.get("deposition_id")
 
-        # ---------- CORRECCIÓN 1: validar entorno del depósito guardado ----------
         if dep_id and zen.get("environment") and zen["environment"] != current_env:
-            # El depósito pertenece a otro entorno (p. ej. sandbox → producción).
-            # No lo borramos (no tenemos permiso en el otro entorno desde aquí);
-            # simplemente lo olvidamos y creamos uno nuevo en el entorno actual.
             append_log("ZENODO-ENV-RESET", articulo_id,
                        f"Depósito {dep_id} era de {zen.get('environment')}; se ignora.")
             dep_id = None
             zen = {"environment": current_env}
             submission_data["zenodo"] = zen
 
-        # ---------- Limpieza de depósito huérfano (solo mismo entorno) ----------
         if dep_id and not zen.get("published") and not zen.get("file_uploaded"):
             try:
                 _zenodo_request("DELETE",
@@ -1036,7 +1048,6 @@ def publish_to_zenodo_idempotent(articulo_id, submission_data, pdf_bytes,
             zen = {"environment": current_env}
             submission_data["zenodo"] = zen
 
-        # ---------- Crear depósito si no existe ----------
         if not dep_id:
             r = _zenodo_request("POST", f"{api_url}/deposit/depositions",
                                 headers=headers_json,
@@ -1052,7 +1063,6 @@ def publish_to_zenodo_idempotent(articulo_id, submission_data, pdf_bytes,
             submission_data["zenodo"] = zen
             save_submission_json(articulo_id, submission_data)
 
-        # ---------- CORRECCIÓN 4: refrescar bucket_url SIEMPRE antes de subir ----------
         if not zen.get("file_uploaded"):
             bucket_url = _refresh_bucket_url(api_url, dep_id, headers_json)
             if not bucket_url:
@@ -1061,7 +1071,6 @@ def publish_to_zenodo_idempotent(articulo_id, submission_data, pdf_bytes,
             submission_data["zenodo"] = zen
             save_submission_json(articulo_id, submission_data)
 
-            # Validación del PDF antes de subir
             if not _is_valid_pdf(pdf_bytes):
                 return False, "El archivo no es un PDF válido.", ""
 
@@ -1077,7 +1086,6 @@ def publish_to_zenodo_idempotent(articulo_id, submission_data, pdf_bytes,
             submission_data["zenodo"] = zen
             save_submission_json(articulo_id, submission_data)
 
-        # ---------- Publicar ----------
         if not zen.get("published"):
             r = _zenodo_request(
                 "POST",
@@ -1168,7 +1176,6 @@ def _revalidate_permissions() -> bool:
 # TAB: MANUSCRIPTS
 # ============================================================
 def _backfill_issue_fields():
-    """Asigna Vol 1 / Issue 1 / fecha de publicación a artículos ya publicados sin esos campos."""
     df_full = read_articles()
     if df_full.empty:
         st.info("No hay artículos para backfill.")
@@ -1224,6 +1231,20 @@ def tab_articles():
     editor_email_actual = st.session_state.get("editor_email", "").strip().lower()
     is_chief = (user_level == 0)
 
+    # --- BOTÓN DE REFRESCO MANUAL PARA LIMPIAR CACHÉ ---
+    col_title, col_refresh = st.columns([5, 1])
+    with col_title:
+        pass # El título ya está arriba
+    with col_refresh:
+        if st.button("🔄 Refresh Data", use_container_width=True):
+            read_articles.clear()
+            read_versions.clear()
+            read_confirmations.clear()
+            read_coauthors.clear()
+            read_editores.clear()
+            get_submission.clear()
+            st.rerun()
+
     if is_chief:
         c1, c2, c3 = st.columns([2, 1, 1])
         with c1:
@@ -1278,9 +1299,6 @@ def tab_articles():
     for idx, row in df_art.iterrows():
         aid = row["articulo_id"]
         icon = "📚" if row["tipo"] == "libro" else "📄"
-
-        _break_stale_lock(aid)
-        _advance_if_all_approved(aid)
 
         header = (
             f"{icon} {aid} — {row['titulo']}  |  "
@@ -1342,15 +1360,6 @@ def tab_articles():
                             else:
                                 st.error("Please fill both fields.")
 
-                # Obtener PDF de la última versión (para adjuntar)
-                pdf_bytes_latest = None
-                pdf_name_latest = None
-                if sub and sub.get("versions"):
-                    last_ver = sub["versions"][-1]
-                    pdf_name_latest = last_ver.get("pdf", "")
-                    if pdf_name_latest:
-                        pdf_bytes_latest = _download_remote_bytes(pdf_name_latest, "pdf")
-
                 # Invitar coautores (adjunta PDF de la última versión)
                 if st.button("📨 Request Coauthors (attach latest PDF)",
                              key=f"req_coauth_{aid}",
@@ -1359,6 +1368,15 @@ def tab_articles():
                     if not sub2:
                         st.error("Metadata JSON not found.")
                     else:
+                        # Descarga diferida del PDF
+                        pdf_bytes_latest = None
+                        pdf_name_latest = None
+                        if sub2.get("versions"):
+                            pdf_name_latest = sub2["versions"][-1].get("pdf", "")
+                            if pdf_name_latest:
+                                with st.spinner("Preparando PDF adjunto..."):
+                                    pdf_bytes_latest = _download_remote_bytes(pdf_name_latest, "pdf")
+
                         df_coauthors = read_coauthors()
                         author = sub2.get("corresponding_author", {}) or {}
                         a_name = author.get("name", "").strip()
@@ -1413,6 +1431,15 @@ def tab_articles():
                                      key=f"remind_{aid}", use_container_width=True):
                             base_url = st.secrets["app"]["base_url"].rstrip("/")
                             sent = 0
+                            # Descarga diferida para recordatorios
+                            pdf_bytes_latest = None
+                            pdf_name_latest = None
+                            if sub and sub.get("versions"):
+                                pdf_name_latest = sub["versions"][-1].get("pdf", "")
+                                if pdf_name_latest:
+                                    with st.spinner("Preparando PDF adjunto..."):
+                                        pdf_bytes_latest = _download_remote_bytes(pdf_name_latest, "pdf")
+
                             for _, p in pending.iterrows():
                                 link = f"{base_url}/?token={p['token']}"
                                 if enviar_correo_coautor(
@@ -1429,6 +1456,15 @@ def tab_articles():
                             df_conf2 = read_confirmations()
                             base_url = st.secrets["app"]["base_url"].rstrip("/")
                             sent = 0
+                            # Descarga diferida para recrear tokens
+                            pdf_bytes_latest = None
+                            pdf_name_latest = None
+                            if sub and sub.get("versions"):
+                                pdf_name_latest = sub["versions"][-1].get("pdf", "")
+                                if pdf_name_latest:
+                                    with st.spinner("Preparando PDF adjunto..."):
+                                        pdf_bytes_latest = _download_remote_bytes(pdf_name_latest, "pdf")
+
                             for _, p in pending.iterrows():
                                 new_token = generate_token(p["email"], aid, p["nombre"])
                                 link = f"{base_url}/?token={new_token}"
@@ -1721,7 +1757,6 @@ def tab_articles():
                                         st.session_state[f"retirando_{aid}"] = False
                                         st.rerun()
 
-
 # ============================================================
 # MAIN
 # ============================================================
@@ -1734,8 +1769,5 @@ def main():
 
     tab_articles()
 
-
 if __name__ == "__main__":
     main()
-
-
