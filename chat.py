@@ -1555,7 +1555,7 @@ def main() -> None:
 
     _init_session_state()
 
-    st.title("💬 Chat DeepSeek — cliente local")
+    st.title("💬 Chat  — cliente local")
     st.caption(
         "Cliente de chat que usa **tu API Key** contra `api.deepseek.com`. "
         "El historial vive solo en tu sesión de Streamlit hasta que pulsas "
