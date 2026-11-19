@@ -2,7 +2,7 @@
 r"""
 analizador_reformulacion.py — Streamlit standalone.
 
-Generates a DIAGNOSTIC LETTER to the author with up to 4 reformulation
+Generates a DIAGNOSTIC LETTER to the author with up to 6 reformulation
 weaknesses. It does NOT propose rewrites, steps, or verification criteria.
 """
 
@@ -52,7 +52,7 @@ LOGO_DISPONIBLE = os.path.isfile(LOGO_PATH) and os.path.getsize(LOGO_PATH) > 0
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-chat"
 
-MAX_QUESTIONS = 8
+MAX_QUESTIONS = 6
 MIN_PARAGRAPH_LENGTH = 120
 MAX_FRAGMENT_LENGTH = 300
 MAX_FRAGMENT_LETTER = 300
@@ -329,7 +329,8 @@ def _escape_plain_text(s):
 PROMPT_DETECTION = r"""
 You are an academic editor expert in clarity and argumentative soundness.
 I give you a CONTEXT and a numbered set of PARAGRAPHS from a manuscript.
-Your task: identify at most 3 REFORMULATION weaknesses across those paragraphs.
+Your task: identify up to {max_questions} REFORMULATION weaknesses across
+those paragraphs.
 A weakness is a problem solvable by REWRITING the text, WITHOUT new
 experiments, data, citations, or measurements.
 
@@ -405,7 +406,6 @@ _EXISTING_CITATION_PATTERNS = [
     r'\\cite[a-zA-Z]*\s*\{',
 ]
 
-# [FIX] Detectar si el LLM intentó proponer soluciones (para descartar)
 _SOLUTION_PATTERNS = [
     r'\brewrite\b', r'\breescrib', r'\brephrase\b', r'\breformul',
     r'\bwe suggest\b', r'\byou should\b', r'\bconsider\b',
@@ -440,7 +440,6 @@ def _looks_english(text, threshold=0.6):
 
 
 def _looks_like_solution(text):
-    # [FIX] descarta debilidades cuyo diagnóstico/intención sea proponer solución
     t = (text or "").lower()
     return any(re.search(p, t) for p in _SOLUTION_PATTERNS)
 
@@ -488,15 +487,12 @@ def validate_weakness(deb, paragraph):
     if _asks_for_new_data(diagnostic_text):
         return False, "the diagnosis requires new data"
 
-    # [FIX] rechazar si el LLM intentó proponer solución
     if _looks_like_solution(diagnostic_text):
         return False, "diagnosis contains solution-like language"
 
-    # [FIX] verificación de idioma inglés
     if not _looks_english(diagnostic_text):
         return False, "LLM output is not in English"
 
-    # [FIX] solo se exigen los campos de diagnóstico
     for k in ("diagnostico", "impacto"):
         if not deb.get(k):
             return False, f"empty field: {k}"
@@ -504,13 +500,11 @@ def validate_weakness(deb, paragraph):
     if len(frag) > MAX_FRAGMENT_LENGTH * 2:
         deb["fragmento"] = frag[:MAX_FRAGMENT_LENGTH] + "..."
 
-    # [FIX] eliminar campos de solución si el LLM los devolvió por error
     for k in ("pasos", "reescritura_A", "reescritura_B",
               "criterio_verificacion"):
         deb.pop(k, None)
 
     return True, ""
-
 
 # ============================================================
 # LLM (retries, backoff, tokens)
@@ -538,7 +532,7 @@ class _TokenTracker:
         return self.total > self.budget
 
 
-def _call(client, prompt, model, max_tokens=2000, temperature=0.2,
+def _call(client, prompt, model, max_tokens=3000, temperature=0.2,
           tracker=None, max_retries=4):
     delay = 2.0
     last_err = None
@@ -585,7 +579,7 @@ def analyze_reformulation(client, body, model, progress_cb=None,
     results = []
     rejections = {"llm_empty": 0, "validation": 0, "new_data": 0,
                   "not_english": 0, "bad_paragraph_id": 0,
-                  "solution_like": 0}  # [FIX]
+                  "solution_like": 0}
     previous_paragraphs = []
     tracker = _TokenTracker()
 
@@ -607,10 +601,12 @@ def analyze_reformulation(client, body, model, progress_cb=None,
             chunk_text += f"[PARAGRAPH {p_idx}]\n{p_text}\n\n"
 
         context = _context_summary(previous_paragraphs)
-        prompt = PROMPT_DETECTION.replace("{contexto}", context) \
-                                 .replace("{parrafos}", chunk_text)
+        prompt = (PROMPT_DETECTION
+                  .replace("{max_questions}", str(MAX_QUESTIONS))
+                  .replace("{contexto}", context)
+                  .replace("{parrafos}", chunk_text))
 
-        raw, err = _call(client, prompt, model, max_tokens=2000,
+        raw, err = _call(client, prompt, model, max_tokens=3000,
                          temperature=0.2, tracker=tracker)
         if raw is None:
             st.error(f"❌ Block {chunk_idx+1} failed after retries: {err}")
@@ -702,7 +698,8 @@ def analyze_reformulation(client, body, model, progress_cb=None,
     for r in results:
         cat = r["weakness"]["categoria"]
         pid = r["paragraph_idx"]
-        if seen_cat.get(cat, 0) >= 2:
+        # Tope relajado: máx 3 por categoría, 1 por párrafo.
+        if seen_cat.get(cat, 0) >= 3:
             continue
         if seen_parr.get(pid, 0) >= 1:
             continue
@@ -882,7 +879,6 @@ license.
 \end{document}
 """)
     return "\n".join(L)
-
 
 # ============================================================
 # LaTeX compilation (multi-engine) and auto-correction
@@ -1203,13 +1199,13 @@ def main():
 
     st.title("🔍 Reformulation Diagnostic Letter")
     st.caption(
-        "Upload your manuscript (.tex or .docx). The program **detects** up to 4 "
-        "reformulation weaknesses and generates a **diagnostic letter** for the "
-        "author with the category, the fragment, a diagnosis, and the impact. "
-        "**It does not propose rewrites, steps, or verification criteria**: the "
-        "correction is left to the author. The letter is compiled with LaTeX "
-        "(pdflatex/lualatex/xelatex) and auto-corrected if there are "
-        "typesetting errors.")
+        f"Upload your manuscript (.tex or .docx). The program **detects** up to "
+        f"{MAX_QUESTIONS} reformulation weaknesses and generates a "
+        f"**diagnostic letter** for the author with the category, the fragment, "
+        f"a diagnosis, and the impact. **It does not propose rewrites, steps, "
+        f"or verification criteria**: the correction is left to the author. "
+        f"The letter is compiled with LaTeX (pdflatex/lualatex/xelatex) and "
+        f"auto-corrected if there are typesetting errors.")
 
     with st.sidebar:
         st.header("⚙️ Configuration")
@@ -1470,3 +1466,4 @@ def main():
 # ============================================================
 if __name__ == "__main__":
     main()
+
