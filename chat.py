@@ -797,7 +797,7 @@ def _render_sidebar() -> Dict:
                 value=st.session_state.system_prompt,
                 height=120,
                 key="system_prompt_input",
-                placeholder="Ejemplo: Eres un asistente experto en biología computacional.",
+                placeholder="Ejemplo: Eres un asistente experto en matemática computacional.",
             )
             if st.button("Aplicar system prompt", use_container_width=True):
                 st.session_state.system_prompt = system_prompt.strip()
@@ -1145,13 +1145,13 @@ def _render_chat_tab(cfg: Dict) -> None:
     temperature = cfg["temperature"]
     max_tokens = cfg["max_tokens"]
 
-    st.header("💬 Chat con DeepSeek")
-    st.caption(
-        "Conversación libre usando tu API Key contra `api.deepseek.com`. "
-        "Todo el contenido se muestra en modo bash (monoespaciado). "
-        "Pulsa el clip 📎 junto al campo de chat para adjuntar archivos "
-        "(imágenes, texto o código) al próximo mensaje."
-    )
+#    st.header("💬 Chat con DeepSeek")
+#    st.caption(
+#        "Conversación libre usando tu API Key contra `api.deepseek.com`. "
+#        "Todo el contenido se muestra en modo bash (monoespaciado). "
+#        "Pulsa el clip 📎 junto al campo de chat para adjuntar archivos "
+#        "(imágenes, texto o código) al próximo mensaje."
+#    )
 
     if not api_key or not api_key.startswith("sk-"):
         st.code(
@@ -1396,19 +1396,19 @@ def _render_chat_tab(cfg: Dict) -> None:
         _inject_scroll_anchor()
 
     st.divider()
-    st.code(
-        "# Consejos:\n"
-        "#  (1) El historial se envía completo en cada turno,\n"
-        "#      sujeto a MAX_CONTEXT_MESSAGES.\n"
-        "#  (2) Si crece mucho, reinícialo para reducir costo y latencia.\n"
-        "#  (3) deepseek-chat es rápida y barata;\n"
-        "#      deepseek-reasoner razona mejor pero consume más tokens.\n"
-        "#  (4) Pulsa el clip 📎 para adjuntar archivos al próximo mensaje.\n"
-        "#  (5) Usa «🔄 Próxima conversación» en la barra lateral para\n"
-        "#      guardar el chat en el servidor y empezar uno nuevo.\n"
-        "#  (6) Usa «📂 Recuperar conversación» para cargar un respaldo.",
-        language="bash",
-    )
+#    st.code(
+#        "# Consejos:\n"
+#        "#  (1) El historial se envía completo en cada turno,\n"
+#        "#      sujeto a MAX_CONTEXT_MESSAGES.\n"
+#        "#  (2) Si crece mucho, reinícialo para reducir costo y latencia.\n"
+#        "#  (3) deepseek-chat es rápida y barata;\n"
+#        "#      deepseek-reasoner razona mejor pero consume más tokens.\n"
+#        "#  (4) Pulsa el clip 📎 para adjuntar archivos al próximo mensaje.\n"
+#        "#  (5) Usa «🔄 Próxima conversación» en la barra lateral para\n"
+#        "#      guardar el chat en el servidor y empezar uno nuevo.\n"
+#        "#  (6) Usa «📂 Recuperar conversación» para cargar un respaldo.",
+#        language="bash",
+#    )
 
 # ============================================================
 # Pestaña de Saldo
@@ -1534,12 +1534,12 @@ def _render_balance_tab(cfg: Dict) -> None:
     col_s2.metric("Tokens completion", f"{tracker.completion:,}")
     col_s3.metric("Tokens totales", f"{tracker.total:,}")
 
-    st.code(
-        "# El consumo se refiere solo a esta sesión de Streamlit.\n"
-        "# El saldo real de la cuenta refleja todo el uso histórico\n"
-        "# de la API Key, no solo esta sesión.",
-        language="bash",
-    )
+#    st.code(
+#        "# El consumo se refiere solo a esta sesión de Streamlit.\n"
+#        "# El saldo real de la cuenta refleja todo el uso histórico\n"
+#        "# de la API Key, no solo esta sesión.",
+#        language="bash",
+#    )
 
 
 # ============================================================
@@ -1555,17 +1555,17 @@ def main() -> None:
 
     _init_session_state()
 
-    st.title("💬 Chat  — cliente local")
-    st.caption(
-        "Cliente de chat que usa **tu API Key** contra `api.deepseek.com`. "
-        "El historial vive solo en tu sesión de Streamlit hasta que pulsas "
-        "**🔄 Próxima conversación**, que lo guarda en el servidor remoto. "
-        "**Todo el contenido se muestra en modo bash (monoespaciado).** "
-        "**Pulsa el clip 📎 junto al campo de chat para adjuntar "
-        "imágenes, texto o código al próximo mensaje.** "
-        "**La vista hace scroll automático a la última respuesta tras "
-        "cada turno.**"
-    )
+#    st.title("💬 Chat  — cliente local")
+#    st.caption(
+#        "Cliente de chat que usa **tu API Key** contra `api.deepseek.com`. "
+#        "El historial vive solo en tu sesión de Streamlit hasta que pulsas "
+#        "**🔄 Próxima conversación**, que lo guarda en el servidor remoto. "
+#        "**Todo el contenido se muestra en modo bash (monoespaciado).** "
+#        "**Pulsa el clip 📎 junto al campo de chat para adjuntar "
+#        "imágenes, texto o código al próximo mensaje.** "
+#        "**La vista hace scroll automático a la última respuesta tras "
+#        "cada turno.**"
+#    )
 
     cfg = _render_sidebar()
 
