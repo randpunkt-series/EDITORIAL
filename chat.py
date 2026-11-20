@@ -53,9 +53,9 @@ DEBUG_DIR = os.path.join(BASE_DIR, "debug")
 os.makedirs(DEBUG_DIR, exist_ok=True)
 
 DEFAULT_BASE_URL = "https://api.deepseek.com"
-#DEFAULT_MODEL = "deepseek-chat"
 #DEFAULT_MODEL = "deepseek-v4-pro"
 DEFAULT_MODEL = "deepseek-flash"
+#DEFAULT_MODEL = "deepseek-chat"
 
 
 MAX_TOKENS_BUDGET = 400_000
