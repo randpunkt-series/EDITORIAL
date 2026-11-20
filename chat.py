@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# chat21.py - Chat DeepSeek local con Streamlit
+# chat23.py - Chat DeepSeek local con Streamlit
 # ============================================================
 # Version corregida y dividida en tres partes.
 # Parte 1/3: configuracion, logging, tracker, adjuntos, API.
@@ -53,9 +53,9 @@ DEBUG_DIR = os.path.join(BASE_DIR, "debug")
 os.makedirs(DEBUG_DIR, exist_ok=True)
 
 DEFAULT_BASE_URL = "https://api.deepseek.com"
-DEFAULT_MODEL = "deepseek-chat"
+#DEFAULT_MODEL = "deepseek-chat"
 #DEFAULT_MODEL = "deepseek-v4-pro"
-#DEFAULT_MODEL = "deepseek-flash"
+DEFAULT_MODEL = "deepseek-flash"
 
 
 MAX_TOKENS_BUDGET = 400_000
@@ -98,7 +98,17 @@ DEFAULT_SYSTEM_PROMPT = (
     "lenguaje explicito: ```python para Python, ```latex para LaTeX, "
     "```bash para shell, ```json, ```yaml, etc. "
     "No devuelvas HTML ni escapes el texto a entidades HTML. "
-    "Para matematicas usa LaTeX nativo: $...$ en linea y $$...$$ en bloque."
+    "No uses etiquetas HTML de ningun tipo (div, span, br, b, i, img, "
+    "script, style, svg, math, table, etc.). "
+    "No uses entidades HTML (lt, gt, amp, nbsp, ni referencias numericas). "
+    "No uses comentarios HTML. "
+    "No uses autolinks con corchetes angulares; escribe la URL desnuda. "
+    "No uses esquemas javascript: ni data: en enlaces. "
+    "Para matematicas usa LaTeX nativo: $...$ en linea y $$...$$ en bloque. "
+    "No uses comandos de tamano en LaTeX (small, large, tiny, "
+    "footnotesize, huge, Huge, normalsize). "
+    "No uses encabezados Markdown (almohadilla); usa negrita para "
+    "titulos de seccion."
 )
 
 
@@ -112,8 +122,6 @@ def _get_secret(section: str, key: str, default: str = "") -> str:
             return st.secrets[section][key]
         return st.secrets[key]
     except Exception as e:
-        # No usamos logger aqui porque puede no estar inicializado.
-        # Guardamos en un buffer que el logger recogera al arrancar.
         try:
             st.session_state.setdefault("_secret_warnings", []).append(
                 f"secret {section!r}/{key!r}: {type(e).__name__}: {e}"
@@ -340,7 +348,8 @@ def _read_uploaded_any(
                 data = _safe_read(uf)
                 if len(data) > MAX_IMAGE_BYTES:
                     skipped.append(
-                        f"{name} (> {MAX_IMAGE_BYTES // (1024 * 1024)} MB)"
+                        f"{name} (mayor que "
+                        f"{MAX_IMAGE_BYTES // (1024 * 1024)} MB)"
                     )
                     continue
                 try:
@@ -388,7 +397,8 @@ def _read_uploaded_any(
                 data = _safe_read(uf)
                 if len(data) > MAX_UPLOAD_BYTES:
                     skipped.append(
-                        f"{name} (> {MAX_UPLOAD_BYTES // (1024 * 1024)} MB)"
+                        f"{name} (mayor que "
+                        f"{MAX_UPLOAD_BYTES // (1024 * 1024)} MB)"
                     )
                     continue
                 text, enc = _decode_bytes(data)
@@ -527,6 +537,7 @@ def _call_streaming(
                 except Exception:
                     pass
 
+
 # ============================================================
 # Historial y exportacion
 # ============================================================
@@ -604,8 +615,9 @@ def _export_conversation_json(messages: Sequence[Dict], meta: Dict) -> bytes:
 def _export_conversation_markdown(messages: Sequence[Dict], meta: Dict) -> bytes:
     """
     Exporta a Markdown. El contenido de cada mensaje se envuelve en un
-    fence para que un '## Usuario' dentro de una respuesta no rompa el
-    documento.
+    fence para que un encabezado dentro de una respuesta no rompa el
+    documento. Ademas se sanea el contenido para que el .md no
+    contenga HTML ejecutable si se abre en un visor con HTML activo.
     """
     lines: List[str] = []
     lines.append("# Conversacion con DeepSeek\n")
@@ -616,6 +628,7 @@ def _export_conversation_markdown(messages: Sequence[Dict], meta: Dict) -> bytes
     for m in messages:
         role = m.get("role", "?")
         content = _content_to_str(m.get("content", ""))
+        content = _escape_html_outside_fences(content)
         if role == "system":
             lines.append(f"**system**: {content}\n")
         elif role == "user":
@@ -630,9 +643,223 @@ def _export_conversation_markdown(messages: Sequence[Dict], meta: Dict) -> bytes
             lines.append("````\n")
     return "\n".join(lines).encode("utf-8")
 
+# ============================================================
+# Saneado anti-HTML / anti-inyeccion
+# ============================================================
+
+# Entidades que Streamlit/Markdown decodifican y que pueden
+# reconstruir etiquetas peligrosas.
+_ENTITY_DECODE_MAP = {
+    "&#60;": "<", "&#62;": ">",
+    "&#x3c;": "<", "&#x3e;": ">",
+    "&#x3C;": "<", "&#x3E;": ">",
+    "<": "<", ">": ">",
+}
+
+# Esquemas peligrosos en enlaces Markdown [texto](esquema:...)
+# - javascript: y vbscript: requieren ":" para evitar falsos positivos
+#   con la palabra "javascript" en prosa.
+# - data:text/html y data:application/xhtml+xml NO requieren ":" al
+#   final porque el payload suele ir tras una coma:
+#   data:text/html,<script>...
+_DANGEROUS_URL_SCHEMES = re.compile(
+    r"(?i)(?:"
+    r"\b(?:javascript|vbscript)\s*:"
+    r"|"
+    r"\bdata\s*:\s*(?:text/html|application/xhtml\+xml)"
+    r")"
+)
+
+
+# Comentarios HTML
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+
+# Autolinks con corchetes angulares
+_AUTOLINK_RE = re.compile(
+    r"<\s*(?:https?|ftp|mailto|tel|file)\s*:[^>\s]*\s*>",
+    re.IGNORECASE,
+)
+
+# Cualquier etiqueta HTML (apertura, cierre, autocierre, doctype, PI)
+_HTML_TAG_RE = re.compile(
+    r"<\s*/?\s*[a-zA-Z!?][^<>]*>",
+    re.DOTALL,
+)
+
+# Fences de lenguajes que pueden renderizar HTML/SVG ejecutable
+_DANGEROUS_FENCE_LANGS = {
+    "html", "htm", "xhtml", "svg", "xml", "mathml",
+}
+
+_FENCE_RE = re.compile(
+    r"^(\s*)(`{3,}|~{3,})([^\n`~]*)\n(.*?)\n^\s*\2\s*$",
+    re.DOTALL | re.MULTILINE,
+)
+
+
+def _decode_dangerous_entities(text: str) -> str:
+    """Decodifica entidades que reconstruyen < o >, para luego escaparlas."""
+    if not text:
+        return text
+    for _ in range(2):
+        changed = False
+        for ent, ch in _ENTITY_DECODE_MAP.items():
+            if ent in text:
+                text = text.replace(ent, ch)
+                changed = True
+        if not changed:
+            break
+    return text
+
+
+def _neutralize_dangerous_fences(text: str) -> str:
+    """
+    Convierte fences html/svg/xml en fences text para que Streamlit
+    no intente renderizarlos como HTML/SVG. El contenido se muestra
+    como codigo literal, que es lo que queremos.
+    """
+    if not text:
+        return text
+
+    def _fix(m: re.Match) -> str:
+        indent = m.group(1) or ""
+        fence = m.group(2)
+        lang = (m.group(3) or "").strip().lower()
+        body = m.group(4)
+        if lang in _DANGEROUS_FENCE_LANGS:
+            lang = "text"
+        return f"{indent}{fence}{lang}\n{body}\n{indent}{fence}"
+
+    return _FENCE_RE.sub(_fix, text)
+
+
+def _neutralize_dangerous_links(text: str) -> str:
+    """
+    Sustituye esquemas peligrosos en enlaces Markdown por about:blank.
+    Cubre [texto](javascript:...) y ![alt](data:text/html,...).
+
+    Usa un escaneo manual para manejar parentesis balanceados dentro
+    de la URL (p.ej. javascript:alert(1) o
+    data:text/html,<script>alert(1)</script>).
+    """
+    if not text:
+        return text
+
+    out = []
+    i = 0
+    n = len(text)
+    while i < n:
+        # Buscar el inicio de un enlace Markdown: [texto]( o ![alt](
+        m = re.match(r"(!?\[[^\]]*\])", text[i:])
+        if not m:
+            out.append(text[i])
+            i += 1
+            continue
+        prefix = m.group(1)
+        j = i + len(prefix)
+        if j >= n or text[j] != "(":
+            out.append(text[i])
+            i += 1
+            continue
+        # Encontrado [texto]( -> buscar el ) de cierre balanceado
+        depth = 1
+        k = j + 1
+        while k < n and depth > 0:
+            if text[k] == "(":
+                depth += 1
+            elif text[k] == ")":
+                depth -= 1
+            k += 1
+        if depth != 0:
+            # Parentesis sin cerrar: dejar el texto tal cual
+            out.append(text[i])
+            i += 1
+            continue
+        url = text[j + 1:k - 1]
+        if _DANGEROUS_URL_SCHEMES.search(url):
+            out.append(f"{prefix}(about:blank)")
+        else:
+            out.append(text[i:k])
+        i = k
+
+    return "".join(out)
+
+
+
+
+def _escape_html_outside_fences(text: str) -> str:
+    """
+    Saneador unico. Garantiza que NINGUN caracter de apertura o cierre
+    de etiqueta llegue a Streamlit fuera de bloques de codigo, y que
+    no haya entidades que reconstruyan etiquetas.
+    """
+    if not text:
+        return text
+
+    # 1. Neutralizar fences peligrosas ANTES de protegerlas
+    text = _neutralize_dangerous_fences(text)
+
+    # 2. Neutralizar enlaces con esquemas peligrosos
+    text = _neutralize_dangerous_links(text)
+
+    # 3. Proteger fences de codigo (ya saneadas)
+    marker = f"\x00{uuid.uuid4().hex}_"
+    preserved: List[str] = []
+
+    def _stash(m):
+        preserved.append(m.group(0))
+        return f"{marker}{len(preserved) - 1}\x00"
+
+    tmp = re.sub(r"```.*?```", _stash, text, flags=re.DOTALL)
+    tmp = re.sub(r"~~~.*?~~~", _stash, tmp, flags=re.DOTALL)
+
+    # 4. Proteger LaTeX (solo si NO contiene < ni >, para no
+    #    esconder inyecciones dentro de formulas)
+    def _stash_math(m):
+        body = m.group(0)
+        if "<" in body or ">" in body:
+            return body
+        preserved.append(body)
+        return f"{marker}{len(preserved) - 1}\x00"
+
+    tmp = re.sub(r"\$\$.*?\$\$", _stash_math, tmp, flags=re.DOTALL)
+    tmp = re.sub(
+        r"(?<!\$)\$(?!\$)[^$\n]+?\$(?!\$)",
+        _stash_math,
+        tmp,
+    )
+
+    # 5. Neutralizar comentarios HTML
+    tmp = _HTML_COMMENT_RE.sub("", tmp)
+
+    # 6. Neutralizar autolinks con corchetes angulares
+    tmp = _AUTOLINK_RE.sub(
+        lambda m: m.group(0).replace("<", "<").replace(">", ">"),
+        tmp,
+    )
+
+    # 7. Decodificar entidades peligrosas y volver a escapar
+    tmp = _decode_dangerous_entities(tmp)
+
+    # 8. Escapar TODOS los < y > restantes
+    tmp = tmp.replace("<", "<").replace(">", ">")
+
+    # 9. Escapar & sueltos que no formen entidad valida
+    tmp = re.sub(
+        r"&(?!(?:[a-zA-Z][a-zA-Z0-9]{1,31}|#\d{1,7}|#x[0-9a-fA-F]{1,6});)",
+        "&",
+        tmp,
+    )
+
+    # 10. Restaurar bloques protegidos
+    for i, blk in enumerate(preserved):
+        tmp = tmp.replace(f"{marker}{i}\x00", blk)
+
+    return tmp
+
 
 # ============================================================
-# Renderizado
+# Normalizacion LaTeX
 # ============================================================
 _LANG_ALIASES = {
     "py": "python", "python3": "python",
@@ -650,32 +877,21 @@ _LANG_ALIASES = {
 }
 
 _LATEX_INLINE_PAREN = re.compile(r"\\$(.+?)\\$", re.DOTALL)
-_LATEX_BLOCK_BRACK = re.compile(r"\\$$(.+?)\\$$", re.DOTALL)
-
-_FENCE_RE = re.compile(
-    r"^(\s*)(`{3,}|~{3,})([^\n`~]*)\n(.*?)\n^\s*\2\s*$",
-    re.DOTALL | re.MULTILINE,
-)
-
-_HTML_LIKE_RE = re.compile(
-    r"<\s*/?\s*[a-zA-Z][a-zA-Z0-9]*(\s|>|/)",
-)
-_EVENT_ATTR_RE = re.compile(
-    r"\bon[a-zA-Z]+\s*=",
-    re.IGNORECASE,
-)
+_LATEX_BLOCK_BRACK = re.compile(r"\\[(.+?)\\]", re.DOTALL)
 
 
 def _normalize_latex_delimiters(text: str) -> str:
     r"""
-    Convierte todos los delimitadores LaTeX a $...$ y $$...$$.
+    Convierte delimitadores LaTeX alternativos a $...$ y $$...$$.
 
     Variantes que maneja:
       \[ ... \]       -> $$ ... $$
       \( ... \)       -> $ ... $
-      [ ... ]         -> $$ ... $$   (solo si parece formula)
       \begin{equation} ... \end{equation} -> $$ ... $$
       \begin{align} ... \end{align}       -> $$ ... $$
+
+    NO convierte [ ... ] a $$ ... $$: esa heuristica rompia listas
+    Markdown y texto entre corchetes durante el streaming.
     """
     if not text:
         return text
@@ -691,7 +907,7 @@ def _normalize_latex_delimiters(text: str) -> str:
     tmp = re.sub(r"```.*?```", _stash, text, flags=re.DOTALL)
     tmp = re.sub(r"~~~.*?~~~", _stash, tmp, flags=re.DOTALL)
 
-    # 2. \[ ... \]  ->  $$ ... $$
+    # 2. \[ ... \]  ->  [ ... ]
     tmp = re.sub(
         r"\\\[(.+?)\\\]",
         lambda m: f"$${m.group(1)}$$",
@@ -707,8 +923,7 @@ def _normalize_latex_delimiters(text: str) -> str:
         flags=re.DOTALL,
     )
 
-    # 4. \begin{equation} ... \end{equation}  ->  $$ ... $$
-    #    (y equation*, align, align*, gather, gather*, multline, eqnarray)
+    # 4. \begin{env} ... \end{env}  ->  [ ... ]
     for env in ("equation", "equation*", "align", "align*",
                 "gather", "gather*", "multline", "multline*",
                 "eqnarray", "eqnarray*"):
@@ -719,23 +934,7 @@ def _normalize_latex_delimiters(text: str) -> str:
             flags=re.DOTALL,
         )
 
-    # 5. [ ... ]  ->  $$ ... $$   (solo si parece formula matematica)
-    #    Heuristica: el contenido tiene \frac, \int, \sum, ^, _, =, etc.
-    def _bracket_to_block(m):
-        body = m.group(1).strip()
-        # Si no parece formula, lo dejamos como estaba
-        if not re.search(r"[\\^_=]|\\frac|\\int|\\sum|\\sqrt", body):
-            return m.group(0)
-        return f"$${body}$$"
-
-    tmp = re.sub(
-        r"\[\s*([^\[\]]+?)\s*\]",
-        _bracket_to_block,
-        tmp,
-        flags=re.DOTALL,
-    )
-
-    # 6. Restauramos bloques de codigo
+    # 5. Restauramos bloques de codigo
     for i, blk in enumerate(stash):
         tmp = tmp.replace(f"{marker}{i}\x00", blk)
 
@@ -746,7 +945,7 @@ def _normalize_latex(text: str) -> str:
     if not text:
         return text
 
-    # 1. Convertir todos los delimitadores LaTeX a $...$ / $$...$$
+    # 1. Convertir delimitadores LaTeX alternativos
     text = _normalize_latex_delimiters(text)
 
     # 2. Proteger bloques de codigo para no tocarlos
@@ -760,17 +959,59 @@ def _normalize_latex(text: str) -> str:
     tmp = re.sub(r"```.*?```", _stash, text, flags=re.DOTALL)
     tmp = re.sub(r"~~~.*?~~~", _stash, tmp, flags=re.DOTALL)
 
-    # 3. Conversion de delimitadores alternativos que queden sueltos
-    tmp = _LATEX_INLINE_PAREN.sub(lambda m: f"${m.group(1)}$", tmp)
-    tmp = _LATEX_BLOCK_BRACK.sub(lambda m: f"$${m.group(1)}$$", tmp)
-
-    # 4. Restaurar bloques de codigo
+    # 3. Restaurar bloques de codigo
     for i, blk in enumerate(code_blocks):
         tmp = tmp.replace(f"{marker}{i}\x00", blk)
 
     return tmp
 
 
+
+def _close_open_math(text: str) -> str:
+    """
+    Cierra delimitadores LaTeX abiertos al final del texto para que
+    KaTeX pueda renderizar durante el streaming. No altera el texto
+    guardado; solo la vista parcial.
+    """
+    if not text:
+        return text
+
+    # Bloques $$...$$
+    n_dd = len(re.findall(r"(?<!\\)\$\$", text))
+    if n_dd % 2 == 1:
+        return text + "$$"
+
+    # $...$ simples (excluyendo los $$ ya contados)
+    tmp = re.sub(r"(?<!\\)\$\$", "", text)
+    n_s = len(re.findall(r"(?<!\\)\$", tmp))
+    if n_s % 2 == 1:
+        return text + "$"
+
+    # Delimitadores \( ... \) y \[ ... \]
+    if text.count(r"\(") > text.count(r"\)"):
+        return text + r"\)"
+    if text.count(r"\[") > text.count(r"\]"):
+        return text + r"\]"
+
+    return text
+
+
+def _close_open_html(text: str) -> str:
+    """Si el texto termina en un caracter de apertura de etiqueta sin
+    cierre, lo escapa para que no se muestre a medias."""
+    if not text:
+        return text
+    last_lt = text.rfind("<")
+    if last_lt == -1:
+        return text
+    if ">" not in text[last_lt:]:
+        return text[:last_lt] + text[last_lt:].replace("<", "<")
+    return text
+
+
+# ============================================================
+# Fences y headings
+# ============================================================
 def _guess_fence_language(body: str) -> str:
     s = body.lstrip()
     if not s:
@@ -798,14 +1039,16 @@ def _normalize_fences(text: str) -> str:
 
     def _fix(m: re.Match) -> str:
         indent = m.group(1) or ""
+        fence = m.group(2)
         raw_lang = (m.group(3) or "").strip().lower()
         body = m.group(4)
         lang = _LANG_ALIASES.get(raw_lang, raw_lang)
         if not lang:
             lang = _guess_fence_language(body)
-        return f"{indent}```{lang}\n{body}\n{indent}```"
+        return f"{indent}{fence}{lang}\n{body}\n{indent}{fence}"
 
     return _FENCE_RE.sub(_fix, text)
+
 
 
 _HEADING_RE = re.compile(r"^(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$", re.MULTILINE)
@@ -836,28 +1079,9 @@ def _flatten_headings(text: str) -> str:
     return tmp
 
 
-def _escape_html_outside_fences(text: str) -> str:
-    if not text:
-        return text
-    if not (_HTML_LIKE_RE.search(text) or _EVENT_ATTR_RE.search(text)):
-        return text
-    marker = f"\x00{uuid.uuid4().hex}_"
-    preserved: List[str] = []
-
-    def _stash(m):
-        preserved.append(m.group(0))
-        return f"{marker}{len(preserved) - 1}\x00"
-
-    tmp = re.sub(r"```.*?```", _stash, text, flags=re.DOTALL)
-    tmp = re.sub(r"~~~.*?~~~", _stash, tmp, flags=re.DOTALL)
-    tmp = re.sub(r"\$\$.*?\$\$", _stash, tmp, flags=re.DOTALL)
-    tmp = re.sub(r"(?<!\$)\$(?!\$)[^$\n]+?\$(?!\$)", _stash, tmp)
-    tmp = html.escape(tmp, quote=False)
-    for i, blk in enumerate(preserved):
-        tmp = tmp.replace(f"{marker}{i}\x00", blk)
-    return tmp
-
-
+# ============================================================
+# Renderizado
+# ============================================================
 def _prepare_for_render(text: str, flatten_headings: bool = True) -> str:
     text = _normalize_latex(text)
     text = _normalize_fences(text)
@@ -870,17 +1094,19 @@ def _prepare_for_render(text: str, flatten_headings: bool = True) -> str:
 def _render_markdown_safe(text: str, flatten_headings: bool = True) -> None:
     if not text:
         return
-    st.markdown(
-        _prepare_for_render(text, flatten_headings=flatten_headings),
-        unsafe_allow_html=False,
-    )
+    prepared = _prepare_for_render(text, flatten_headings=flatten_headings)
+    # Cinturon de seguridad: si algo se colo, mostrarlo como codigo
+    # en lugar de arriesgar renderizado.
+    if re.search(r"<\s*/?\s*[a-zA-Z!?]", prepared):
+        st.code(prepared, language="text")
+        return
+    st.markdown(prepared, unsafe_allow_html=False)
 
 
 def _show_response_text(text: str) -> None:
     """
     Muestra la respuesta en un expander con st.code (que ya trae boton
-    de copiar nativo). Antes se llamaba _render_copy_button pero no
-    copiaba nada.
+    de copiar nativo).
     """
     if not text:
         return
@@ -891,20 +1117,41 @@ def _show_response_text(text: str) -> None:
 def _self_test_latex() -> Tuple[bool, str]:
     try:
         sample = (
-            r"Inline: \(a^2 + b^2 = c^2\)" + "\n\n"
+            r"Inline: $a^2 + b^2 = c^2$" + "\n\n"
             + "Bloque:\n"
-            + r"\[" + "\n"
+            + r"$$" + "\n"
             + r"\int_0^1 x^2 dx = 1/3" + "\n"
-            + r"\]" + "\n"
+            + r"$$" + "\n"
         )
         out = _normalize_latex(sample)
         if "$a^2 + b^2 = c^2$" not in out:
-            return False, "No se convirtio \\(...\\) a $...$"
+            return False, r"No se convirtio \$...\$ a $...$"
         if "$$" not in out:
-            return False, "No se convirtio \\[...\\] a $$...$$"
+            return False, r"No se convirtio \[...\] a $$...$$"
         return True, "OK: delimitadores alternativos convertidos"
     except Exception as e:
         return False, f"Excepcion en _normalize_latex: {e}"
+
+
+def _self_test_html() -> Tuple[bool, str]:
+    try:
+        sample = (
+            "Hola <script>alert(1)</script> mundo\n"
+            "Entidad: <img src=x onerror=alert(1)>\n"
+            "Comentario: <!-- oculto -->\n"
+            "Autolink: <https://example.com>\n"
+            "Enlace: [click](javascript:alert(1))\n"
+        )
+        out = _escape_html_outside_fences(sample)
+        if "<script" in out or "<img" in out:
+            return False, "Quedo una etiqueta sin escapar"
+        if "<!--" in out:
+            return False, "Quedo un comentario HTML"
+        if "javascript:" in out:
+            return False, "Quedo un esquema javascript:"
+        return True, "OK: HTML neutralizado"
+    except Exception as e:
+        return False, f"Excepcion en _escape_html_outside_fences: {e}"
 
 
 # ============================================================
@@ -1229,8 +1476,6 @@ def _derive_title_from_messages(
             txt = re.sub(r"\s+", " ", txt).strip()
             if txt:
                 raw = txt[:max_len] + ("..." if len(txt) > max_len else "")
-                # Sanitizamos igual que al guardar, para que el titulo
-                # mostrado y el almacenado sean coherentes.
                 return _sanitize_title_for_storage(raw)
     return datetime.datetime.now().strftime("Chat del %Y-%m-%d %H:%M")
 
@@ -1330,6 +1575,8 @@ def load_backup_into_session(json_bytes: bytes) -> Tuple[bool, str]:
         tokens_total = 0
 
     st.session_state.messages = messages
+
+
     st.session_state.conversation_meta = {
         "ts": meta.get("ts") or datetime.datetime.now().strftime("%Y%m%d_%H%M%S"),
         "model": meta.get("model", DEFAULT_MODEL),
@@ -1340,6 +1587,7 @@ def load_backup_into_session(json_bytes: bytes) -> Tuple[bool, str]:
         st.session_state.tracker.completion = tokens_total
     st.session_state["_turn_counter"] = len(messages)
     return True, f"Cargados {len(messages)} mensaje(s) del respaldo."
+
 
 # ============================================================
 # CSS global
@@ -1353,7 +1601,21 @@ _GLOBAL_CSS = """
     word-wrap: break-word !important;
     overflow-wrap: break-word !important;
     max-width: 100% !important;
-    font-size: 0.95em !important;
+    font-size: 1em !important;
+}
+[data-testid="stChatMessage"] h1,
+[data-testid="stChatMessage"] h2,
+[data-testid="stChatMessage"] h3,
+[data-testid="stChatMessage"] h4,
+[data-testid="stChatMessage"] h5,
+[data-testid="stChatMessage"] h6 {
+    font-size: 1.05em !important;
+    font-weight: 600 !important;
+    margin: 0.6em 0 0.3em 0 !important;
+}
+[data-testid="stChatMessage"] p,
+[data-testid="stChatMessage"] li {
+    font-size: 1em !important;
 }
 .katex-display,
 .katex {
@@ -1412,7 +1674,6 @@ def _init_session_state() -> None:
         st.session_state.logger = logger
         st.session_state.run_id = run_id
         st.session_state.log_path = log_path
-        # Volcamos warnings de secretos acumulados antes del logger.
         for w in st.session_state.get("_secret_warnings", []):
             _log(logger, event="secret_warning", detail=w)
     if "conversation_meta" not in st.session_state:
@@ -1526,17 +1787,14 @@ def _render_sidebar_controls() -> Dict:
             key="base_url_input",
         )
 
-
-
         st.checkbox(
             "Aplanar headings",
             key="flatten_headings",
             help=(
-                "Convierte `# Titulo` en `**Titulo**` (negrita). "
-                "Útil si los headings se ven mal en el chat."
+                "Convierte encabezados Markdown en negrita. "
+                "Util si los headings se ven mal en el chat."
             ),
         )
-
 
         return {
             "api_key": api_key.strip(),
@@ -1593,7 +1851,6 @@ def _render_sidebar_actions() -> None:
         if "_copied" in st.session_state:
             with st.expander("Historial copiado", expanded=False):
                 st.code(st.session_state["_copied"], language="bash")
-            # Limpiamos tras mostrarlo para no arrastrarlo entre reruns.
             del st.session_state["_copied"]
 
         with st.expander("Debug", expanded=False):
@@ -1613,7 +1870,7 @@ def _render_sidebar_actions() -> None:
             if st.button(
                 "Ejecutar self-tests",
                 use_container_width=True,
-                help="Verifica el fix LaTeX.",
+                help="Verifica el fix LaTeX y el saneado HTML.",
             ):
                 st.session_state["_run_self_tests"] = True
 
@@ -1623,6 +1880,11 @@ def _render_sidebar_actions() -> None:
                     st.success(f"LaTeX: {msg_latex}")
                 else:
                     st.error(f"LaTeX: {msg_latex}")
+                ok_html, msg_html = _self_test_html()
+                if ok_html:
+                    st.success(f"HTML: {msg_html}")
+                else:
+                    st.error(f"HTML: {msg_html}")
 
             if st.button(
                 "Limpiar carpeta debug/",
@@ -1766,7 +2028,6 @@ def _render_simple_upload_panel() -> Tuple[Dict[str, Dict], Dict[str, Dict]]:
         )
         return {}, {}
 
-    # Dedupe: no re-procesar archivos ya vistos en esta sesion de uploader.
     seen = st.session_state.get("_seen_uploads", set())
     new_files = []
     for uf in uploaded_files:
@@ -1918,7 +2179,6 @@ def _handle_user_input(
     else:
         user_content = user_text
 
-    # Comprobamos budget ANTES de anadir el mensaje del usuario.
     tracker: _TokenTracker = st.session_state.tracker
     if tracker.over_budget():
         st.code(
@@ -1931,8 +2191,6 @@ def _handle_user_input(
     user_msg = {"role": "user", "content": user_content}
     st.session_state.messages.append(user_msg)
 
-    # Render consistente con el historico: mostramos el mismo texto
-    # que se guarda (con bloques de adjuntos si los hay).
     _render_message("user", user_content)
 
     _log(
@@ -1956,7 +2214,6 @@ def _handle_user_input(
     )
 
     if full_response is None:
-        # Error: quitamos el mensaje del usuario para no dejarlo huerfano.
         if (
             st.session_state.messages
             and st.session_state.messages[-1] is user_msg
@@ -1981,7 +2238,6 @@ def _handle_user_input(
         int(st.session_state.get("_turn_counter", 0)) + 1
     )
 
-    # Rotacion de debug cada N turnos, no en cada turno.
     if st.session_state["_turn_counter"] % ROTATE_DEBUG_EVERY_N_TURNS == 0:
         _rotate_debug_dir()
 
@@ -2004,6 +2260,7 @@ def _stream_assistant_response(
     with st.chat_message("assistant", avatar="🤖"):
         placeholder = st.empty()
         full_response = ""
+        last_render = 0.0
         try:
             for delta in _call_streaming(
                 client=client,
@@ -2014,9 +2271,16 @@ def _stream_assistant_response(
                 tracker=tracker,
             ):
                 full_response += delta
+                now = time.monotonic()
+                if now - last_render < 0.08:
+                    continue
+                last_render = now
                 placeholder.markdown(
                     _prepare_for_render(
-                        full_response + "|", flatten_headings=flatten,
+                        _close_open_html(
+                            _close_open_math(full_response)
+                        ) + "▌",
+                        flatten_headings=flatten,
                     ),
                     unsafe_allow_html=False,
                 )
