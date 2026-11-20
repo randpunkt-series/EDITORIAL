@@ -53,7 +53,10 @@ DEBUG_DIR = os.path.join(BASE_DIR, "debug")
 os.makedirs(DEBUG_DIR, exist_ok=True)
 
 DEFAULT_BASE_URL = "https://api.deepseek.com"
-DEFAULT_MODEL = "deepseek-chat"
+#DEFAULT_MODEL = "deepseek-chat"
+#DEFAULT_MODEL = "deepseek-v4-pro"
+DEFAULT_MODEL = "deepseek-flash"
+
 
 MAX_TOKENS_BUDGET = 400_000
 MAX_DEBUG_FILES = 50
@@ -663,9 +666,90 @@ _EVENT_ATTR_RE = re.compile(
 )
 
 
+def _normalize_latex_delimiters(text: str) -> str:
+    r"""
+    Convierte todos los delimitadores LaTeX a $...$ y $$...$$.
+
+    Variantes que maneja:
+      \[ ... \]       -> $$ ... $$
+      \( ... \)       -> $ ... $
+      [ ... ]         -> $$ ... $$   (solo si parece formula)
+      \begin{equation} ... \end{equation} -> $$ ... $$
+      \begin{align} ... \end{align}       -> $$ ... $$
+    """
+    if not text:
+        return text
+
+    # 1. Protegemos bloques de codigo para no tocarlos
+    marker = f"\x00{uuid.uuid4().hex}_"
+    stash: List[str] = []
+
+    def _stash(m):
+        stash.append(m.group(0))
+        return f"{marker}{len(stash) - 1}\x00"
+
+    tmp = re.sub(r"```.*?```", _stash, text, flags=re.DOTALL)
+    tmp = re.sub(r"~~~.*?~~~", _stash, tmp, flags=re.DOTALL)
+
+    # 2. \[ ... \]  ->  $$ ... $$
+    tmp = re.sub(
+        r"\\\[(.+?)\\\]",
+        lambda m: f"$${m.group(1)}$$",
+        tmp,
+        flags=re.DOTALL,
+    )
+
+    # 3. \( ... \)  ->  $ ... $
+    tmp = re.sub(
+        r"\\\((.+?)\\\)",
+        lambda m: f"${m.group(1)}$",
+        tmp,
+        flags=re.DOTALL,
+    )
+
+    # 4. \begin{equation} ... \end{equation}  ->  $$ ... $$
+    #    (y equation*, align, align*, gather, gather*, multline, eqnarray)
+    for env in ("equation", "equation*", "align", "align*",
+                "gather", "gather*", "multline", "multline*",
+                "eqnarray", "eqnarray*"):
+        tmp = re.sub(
+            rf"\\begin\{{{re.escape(env)}\}}(.+?)\\end\{{{re.escape(env)}\}}",
+            lambda m: f"$${m.group(1)}$$",
+            tmp,
+            flags=re.DOTALL,
+        )
+
+    # 5. [ ... ]  ->  $$ ... $$   (solo si parece formula matematica)
+    #    Heuristica: el contenido tiene \frac, \int, \sum, ^, _, =, etc.
+    def _bracket_to_block(m):
+        body = m.group(1).strip()
+        # Si no parece formula, lo dejamos como estaba
+        if not re.search(r"[\\^_=]|\\frac|\\int|\\sum|\\sqrt", body):
+            return m.group(0)
+        return f"$${body}$$"
+
+    tmp = re.sub(
+        r"\[\s*([^\[\]]+?)\s*\]",
+        _bracket_to_block,
+        tmp,
+        flags=re.DOTALL,
+    )
+
+    # 6. Restauramos bloques de codigo
+    for i, blk in enumerate(stash):
+        tmp = tmp.replace(f"{marker}{i}\x00", blk)
+
+    return tmp
+
+
 def _normalize_latex(text: str) -> str:
     if not text:
         return text
+
+    # 1. Convertir todos los delimitadores LaTeX a $...$ / $$...$$
+    text = _normalize_latex_delimiters(text)
+
+    # 2. Proteger bloques de codigo para no tocarlos
     marker = f"\x00{uuid.uuid4().hex}_"
     code_blocks: List[str] = []
 
@@ -675,10 +759,15 @@ def _normalize_latex(text: str) -> str:
 
     tmp = re.sub(r"```.*?```", _stash, text, flags=re.DOTALL)
     tmp = re.sub(r"~~~.*?~~~", _stash, tmp, flags=re.DOTALL)
+
+    # 3. Conversion de delimitadores alternativos que queden sueltos
     tmp = _LATEX_INLINE_PAREN.sub(lambda m: f"${m.group(1)}$", tmp)
     tmp = _LATEX_BLOCK_BRACK.sub(lambda m: f"$${m.group(1)}$$", tmp)
+
+    # 4. Restaurar bloques de codigo
     for i, blk in enumerate(code_blocks):
         tmp = tmp.replace(f"{marker}{i}\x00", blk)
+
     return tmp
 
 
@@ -1437,14 +1526,17 @@ def _render_sidebar_controls() -> Dict:
             key="base_url_input",
         )
 
+
+
         st.checkbox(
-            "Aplanar headings (# -> **negrita**)",
+            "Aplanar headings",
             key="flatten_headings",
             help=(
-                "Convierte '# Titulo' en '**Titulo**'. Util si los "
-                "headings de Streamlit se ven mal dentro del chat."
+                "Convierte `# Titulo` en `**Titulo**` (negrita). "
+                "Útil si los headings se ven mal en el chat."
             ),
         )
+
 
         return {
             "api_key": api_key.strip(),
