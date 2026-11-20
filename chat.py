@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# chat13.py — Chat DeepSeek local con Streamlit
-# - LaTeX nativo (KaTeX), sin HTML inyectado.
-# - Bloques de código con lenguaje correcto (python, latex, bash…).
-# - Adjuntos y respaldos SFTP.
+# chat21.py - Chat DeepSeek local con Streamlit
+# ============================================================
+# Version corregida y dividida en tres partes.
+# Parte 1/3: configuracion, logging, tracker, adjuntos, API.
 # ============================================================
 
 from __future__ import annotations
@@ -16,17 +16,24 @@ import json
 import time
 import uuid
 import base64
+import html
+import posixpath
+import stat as stat_module
 import logging
 import datetime
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 from io import StringIO
 
 import streamlit as st
-import requests
 import paramiko
 
 try:
-    from openai import OpenAI
+    from openai import (
+        OpenAI,
+        APIStatusError,
+        APITimeoutError,
+        APIConnectionError,
+    )
 except ImportError:
     st.error("Falta openai: pip install openai")
     st.stop()
@@ -37,30 +44,9 @@ except ImportError:
     st.error("Falta pillow: pip install pillow")
     st.stop()
 
-# ============================================================
-# GUARDIA: detectar entidades HTML residuales en el propio fuente.
-# ============================================================
-def _check_source_not_html_escaped() -> None:
-    try:
-        with open(__file__, "r", encoding="utf-8") as fh:
-            src = fh.read()
-    except Exception:
-        return
-    pat = re.compile(r"&(quot|amp|lt|gt|#x27|#39|apos|nbsp);")
-    hits = pat.findall(src)
-    if hits:
-        st.error(
-            "El archivo fuente contiene entidades HTML escapadas "
-            f"({len(hits)} ocurrencias de {sorted(set(hits))}). "
-            "Cópialo/guárdalo como texto plano UTF-8, no desde un "
-            "editor con vista enriquecida."
-        )
-        st.stop()
-
-_check_source_not_html_escaped()
 
 # ============================================================
-# Configuración
+# Configuracion
 # ============================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEBUG_DIR = os.path.join(BASE_DIR, "debug")
@@ -72,9 +58,14 @@ DEFAULT_MODEL = "deepseek-chat"
 MAX_TOKENS_BUDGET = 400_000
 MAX_DEBUG_FILES = 50
 MAX_CONTEXT_MESSAGES = 40
-MAX_TOKENS_RESPONSE = 4096
+ROTATE_DEBUG_EVERY_N_TURNS = 10
 
-# --- Textos ---
+FIXED_TEMPERATURE = 0.23
+FIXED_MAX_TOKENS = 8192
+
+# Configurable desde el sidebar; este es el valor por defecto.
+DEFAULT_FLATTEN_HEADINGS = True
+
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024
 MAX_UPLOAD_FILES = 20
 ALLOWED_UPLOAD_EXTENSIONS = [
@@ -83,46 +74,90 @@ ALLOWED_UPLOAD_EXTENSIONS = [
     "js", "ts", "html", "css", "xml", "yaml", "yml",
     "sh", "bash", "sql", "c", "h", "cpp", "hpp",
     "java", "go", "rs", "rb", "php", "pl", "lua", "cls",
-    "toml", "ini", "cfg", "conf", "env", "bib", "docx", "doc"
+    "toml", "ini", "cfg", "conf", "env", "bib", "docx", "doc",
 ]
 
-# --- Imágenes ---
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_IMAGE_FILES = 10
 ALLOWED_IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "webp", "gif", "bmp", "pdf"]
 
-MULTIMODAL_MODELS = {"deepseek-chat"}
+# Modelos que aceptan contenido multimodal (image_url).
+# Si esta vacio, las imagenes se envian solo como metadatos/thumbnail.
+MULTIMODAL_MODELS: set = set()
 
-AVAILABLE_MODELS = [
-    "deepseek-chat",
-    "deepseek-reasoner",
-]
+ALLOWED_IMAGE_MIMES = {
+    "image/png", "image/jpeg", "image/jpg", "image/webp",
+    "image/gif", "image/bmp",
+}
 
-# System prompt por defecto (solo se usa si el usuario no define uno).
 DEFAULT_SYSTEM_PROMPT = (
-    "Cuando devuelvas código, usa siempre bloques de código con el "
-    "lenguaje explícito: ```python para Python, ```latex para LaTeX, "
+    "Cuando devuelvas codigo, usa siempre bloques de codigo con el "
+    "lenguaje explicito: ```python para Python, ```latex para LaTeX, "
     "```bash para shell, ```json, ```yaml, etc. "
     "No devuelvas HTML ni escapes el texto a entidades HTML. "
-    "Para matemáticas usa LaTeX nativo: $...$ en línea y $$...$$ en bloque."
+    "Para matematicas usa LaTeX nativo: $...$ en linea y $$...$$ en bloque."
 )
 
 
+# ============================================================
+# Helpers de secretos y rutas
+# ============================================================
 def _get_secret(section: str, key: str, default: str = "") -> str:
+    """Lee un secreto de st.secrets. Loguea en debug si falla."""
     try:
         if section:
             return st.secrets[section][key]
         return st.secrets[key]
-    except Exception:
+    except Exception as e:
+        # No usamos logger aqui porque puede no estar inicializado.
+        # Guardamos en un buffer que el logger recogera al arrancar.
+        try:
+            st.session_state.setdefault("_secret_warnings", []).append(
+                f"secret {section!r}/{key!r}: {type(e).__name__}: {e}"
+            )
+        except Exception:
+            pass
         return default
 
 
-# Sin key hardcodeada: solo secrets.toml.
-FALLBACK_DEEPSEEK_KEY = _get_secret("", "DEEPSEEK_API_KEY", "")
+def _get_api_key_fallback() -> str:
+    return _get_secret("", "DEEPSEEK_API_KEY", "")
+
+
+def _normalize_remote_dir(raw: str) -> str:
+    """Valida y normaliza un directorio remoto absoluto."""
+    if not isinstance(raw, str):
+        raise ValueError("dir_chat debe ser string")
+    s = raw.strip()
+    if not s:
+        raise ValueError("dir_chat vacio")
+    if not s.startswith("/"):
+        raise ValueError(f"dir_chat debe ser absoluto: {s!r}")
+    norm = posixpath.normpath(s)
+    if norm in ("/", ""):
+        raise ValueError(f"dir_chat no puede ser la raiz: {s!r}")
+    if ".." in norm.split("/"):
+        raise ValueError(f"dir_chat contiene '..': {s!r}")
+    return norm
+
+
+def _get_remote_server_cfg() -> Dict:
+    try:
+        rs = st.secrets["remote_server"]
+        dir_chat = _normalize_remote_dir(rs["dir_chat"])
+        return {
+            "host": rs["host"],
+            "port": int(rs["port"]),
+            "user": rs["user"],
+            "private_key": rs["private_key"],
+            "dir_chat": dir_chat,
+        }
+    except Exception:
+        return {}
 
 
 # ============================================================
-# Logging estructurado (JSONL)
+# Logging
 # ============================================================
 def _setup_run_logger() -> Tuple[logging.Logger, str, str]:
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -142,8 +177,18 @@ def _log(logger: Optional[logging.Logger], **kwargs) -> None:
     if logger is None:
         return
     try:
+        safe = {}
+        for k, v in kwargs.items():
+            kl = k.lower()
+            if kl in {"preview", "content", "text", "prompt", "message"}:
+                if isinstance(v, str):
+                    safe[f"{k}_len"] = len(v)
+                else:
+                    safe[f"{k}_present"] = True
+            else:
+                safe[k] = v
         payload = {"ts": datetime.datetime.now().isoformat(timespec="seconds")}
-        payload.update(kwargs)
+        payload.update(safe)
         logger.info(json.dumps(payload, ensure_ascii=False))
     except Exception:
         pass
@@ -167,7 +212,7 @@ def _rotate_debug_dir(max_files: int = MAX_DEBUG_FILES) -> None:
 
 def _sanitize_filename(name: str) -> str:
     base = os.path.basename(name or "")
-    base = re.sub(r'[^A-Za-z0-9._-]', '_', base)
+    base = re.sub(r"[^A-Za-z0-9._-]", "_", base)
     base = base.lstrip(".-") or "file"
     return base[:180]
 
@@ -203,7 +248,7 @@ class _TokenTracker:
 
 
 # ============================================================
-# Lectura unificada de archivos subidos (texto + imágenes)
+# Lectura de adjuntos
 # ============================================================
 def _decode_bytes(data: bytes) -> Tuple[str, str]:
     for enc in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
@@ -214,6 +259,33 @@ def _decode_bytes(data: bytes) -> Tuple[str, str]:
     return data.decode("latin-1", errors="replace"), "latin-1(replace)"
 
 
+def _safe_read(uf) -> bytes:
+    if hasattr(uf, "seek"):
+        try:
+            uf.seek(0)
+        except Exception:
+            pass
+    return uf.read()
+
+
+def _unique_name(name: str, existing: Sequence[str]) -> str:
+    if name not in existing:
+        return name
+    stem, dot, ext = name.rpartition(".")
+    if not dot:
+        stem, ext = name, ""
+    else:
+        ext = "." + ext
+    max_stem = max(1, 180 - len(ext) - 6)
+    i = 2
+    while True:
+        suffix = f"_{i}"
+        candidate = f"{stem[:max_stem]}{suffix}{ext}"
+        if candidate not in existing:
+            return candidate
+        i += 1
+
+
 def _classify_uploaded_file(uf) -> Tuple[str, str]:
     name = _sanitize_filename(getattr(uf, "name", ""))
     ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
@@ -221,22 +293,24 @@ def _classify_uploaded_file(uf) -> Tuple[str, str]:
         return "image", ext
     if ext in ALLOWED_UPLOAD_EXTENSIONS:
         return "text", ext
-    try:
-        data = uf.getvalue() if hasattr(uf, "getvalue") else uf.read()
-        if hasattr(uf, "seek"):
-            try:
-                uf.seek(0)
-            except Exception:
-                pass
-        try:
-            img = Image.open(io.BytesIO(data))
-            img.load()
-            return "image", ext or "img"
-        except Exception:
-            pass
-    except Exception:
-        pass
     return "unknown", ext
+
+
+def _make_thumbnail(data: bytes, max_side: int = 256) -> bytes:
+    try:
+        img = Image.open(io.BytesIO(data))
+        img.load()
+        img.thumbnail((max_side, max_side))
+        buf = io.BytesIO()
+        fmt = (img.format or "PNG").upper()
+        if fmt not in {"PNG", "JPEG", "WEBP"}:
+            fmt = "PNG"
+        if fmt == "JPEG" and img.mode in {"RGBA", "P"}:
+            img = img.convert("RGB")
+        img.save(buf, format=fmt)
+        return buf.getvalue()
+    except Exception:
+        return data[:4096]
 
 
 def _read_uploaded_any(
@@ -250,6 +324,8 @@ def _read_uploaded_any(
     if not uploaded_files:
         return texts, images, skipped
 
+    model_supports_images = DEFAULT_MODEL in MULTIMODAL_MODELS
+
     for uf in uploaded_files:
         try:
             raw_name = getattr(uf, "name", "?")
@@ -258,14 +334,11 @@ def _read_uploaded_any(
             kind, detected_ext = _classify_uploaded_file(uf)
 
             if kind == "image":
-                data = uf.read()
-                if hasattr(uf, "seek"):
-                    try:
-                        uf.seek(0)
-                    except Exception:
-                        pass
+                data = _safe_read(uf)
                 if len(data) > MAX_IMAGE_BYTES:
-                    skipped.append(f"{name} (> {MAX_IMAGE_BYTES // (1024*1024)} MB)")
+                    skipped.append(
+                        f"{name} (> {MAX_IMAGE_BYTES // (1024 * 1024)} MB)"
+                    )
                     continue
                 try:
                     img = Image.open(io.BytesIO(data))
@@ -273,113 +346,146 @@ def _read_uploaded_any(
                     width, height = img.size
                     fmt = (img.format or ext or "png").upper()
                 except Exception:
-                    skipped.append(f"{name} (no es imagen válida)")
+                    skipped.append(f"{name} (no es imagen valida)")
                     continue
+
                 mime = Image.MIME.get(fmt, f"image/{ext or 'png'}")
-                b64 = base64.b64encode(data).decode("ascii")
-                images[name] = {
-                    "mime": mime,
-                    "size": len(data),
-                    "width": width,
-                    "height": height,
-                    "ext": ext or detected_ext or "img",
-                    "b64": b64,
-                    "data_uri": f"data:{mime};base64,{b64}",
-                    "bytes": data,
-                }
+                if mime not in ALLOWED_IMAGE_MIMES:
+                    skipped.append(f"{name} (MIME no permitido: {mime})")
+                    continue
+
+                unique = _unique_name(
+                    name, list(texts.keys()) + list(images.keys())
+                )
+
+                if model_supports_images:
+                    b64 = base64.b64encode(data).decode("ascii")
+                    images[unique] = {
+                        "mime": mime,
+                        "size": len(data),
+                        "width": width,
+                        "height": height,
+                        "ext": ext or detected_ext or "img",
+                        "b64": b64,
+                        "data_uri": f"data:{mime};base64,{b64}",
+                        "bytes": data,
+                    }
+                else:
+                    images[unique] = {
+                        "mime": mime,
+                        "size": len(data),
+                        "width": width,
+                        "height": height,
+                        "ext": ext or detected_ext or "img",
+                        "b64": None,
+                        "data_uri": None,
+                        "bytes": _make_thumbnail(data),
+                    }
             elif kind == "text":
-                data = uf.read()
+                data = _safe_read(uf)
                 if len(data) > MAX_UPLOAD_BYTES:
-                    skipped.append(f"{name} (> {MAX_UPLOAD_BYTES // (1024*1024)} MB)")
+                    skipped.append(
+                        f"{name} (> {MAX_UPLOAD_BYTES // (1024 * 1024)} MB)"
+                    )
                     continue
                 text, enc = _decode_bytes(data)
-                texts[name] = {
+                unique = _unique_name(
+                    name, list(texts.keys()) + list(images.keys())
+                )
+                nonce = uuid.uuid4().hex
+                texts[unique] = {
                     "content": text,
                     "size": len(data),
                     "encoding": enc,
                     "ext": ext or detected_ext,
                     "lines": text.count("\n") + (1 if text else 0),
+                    "injection_nonce": nonce,
                 }
             else:
-                data = uf.read()
-                if len(data) <= MAX_UPLOAD_BYTES:
-                    text, enc = _decode_bytes(data)
-                    printable = sum(
-                        1 for ch in text[:2000]
-                        if ch.isprintable() or ch in "\n\r\t"
-                    )
-                    if printable >= max(1, min(len(text), 2000)) * 0.9:
-                        texts[name] = {
-                            "content": text,
-                            "size": len(data),
-                            "encoding": enc,
-                            "ext": ext or "txt",
-                            "lines": text.count("\n") + (1 if text else 0),
-                        }
-                        continue
-                skipped.append(f"{name} (tipo desconocido)")
+                skipped.append(
+                    f"{name} (extension no permitida: {ext or 'sin ext'})"
+                )
         except Exception:
             skipped.append(f"{getattr(uf, 'name', '?')} (error)")
 
     return texts, images, skipped
 
 
-# ============================================================
-# Construcción de contenido multimodal
-# ============================================================
 def _build_multimodal_content(text: str, images: Dict[str, Dict]) -> List[Dict]:
     parts: List[Dict] = []
     if text:
         parts.append({"type": "text", "text": text})
+
+    omitted = 0
     for _name, meta in images.items():
-        parts.append({"type": "image_url", "image_url": {"url": meta["data_uri"]}})
+        mime = meta.get("mime")
+        data_uri = meta.get("data_uri")
+        if mime in ALLOWED_IMAGE_MIMES and data_uri:
+            parts.append(
+                {"type": "image_url", "image_url": {"url": data_uri}}
+            )
+        else:
+            omitted += 1
+
+    if omitted:
+        parts.append({
+            "type": "text",
+            "text": (
+                f"[{omitted} imagen(es) omitida(s) por MIME/formato "
+                f"no permitido]"
+            ),
+        })
     return parts
 
 
-# ============================================================
-# Consulta de saldo (DeepSeek API oficial)
-# ============================================================
-def get_deepseek_balance(api_key: str, base_url: str = DEFAULT_BASE_URL) -> dict:
-    try:
-        resp = requests.get(
-            f"{base_url.rstrip('/')}/user/balance",
-            headers={"Accept": "application/json", "Authorization": f"Bearer {api_key}"},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        if not data.get("balance_infos"):
-            return {"error": "La respuesta no contiene balance_infos."}
-        info = data["balance_infos"][0]
-        return {
-            "is_available": data.get("is_available", False),
-            "currency": info.get("currency", "?"),
-            "total_balance": info.get("total_balance", "?"),
-            "granted_balance": info.get("granted_balance", "?"),
-            "topped_up_balance": info.get("topped_up_balance", "?"),
-        }
-    except Exception as e:
-        return {"error": str(e)}
+def _wrap_attachment_text(name: str, meta: Dict) -> str:
+    nonce = meta.get("injection_nonce") or uuid.uuid4().hex
+    return (
+        f"<<<ATTACHMENT_BEGIN {nonce} name={name}>>>\n"
+        f"{meta.get('content', '')}\n"
+        f"<<<ATTACHMENT_END {nonce} name={name}>>>"
+    )
 
 
 # ============================================================
-# Cliente API con reintentos y streaming
+# Cliente API
 # ============================================================
 def _make_client(api_key: str, base_url: str) -> OpenAI:
-    return OpenAI(api_key=api_key, base_url=base_url)
+    return OpenAI(api_key=api_key, base_url=base_url, max_retries=0)
+
+
+_RETRIABLE_STATUS = {429, 500, 502, 503, 504}
+
+
+def _is_retriable_error(e: Exception) -> bool:
+    if isinstance(e, (APITimeoutError, APIConnectionError)):
+        return True
+    if isinstance(e, APIStatusError):
+        try:
+            return int(getattr(e, "status_code", 0)) in _RETRIABLE_STATUS
+        except Exception:
+            return False
+    return False
 
 
 def _call_streaming(
     client: OpenAI,
     messages: Sequence[Dict],
     model: str,
-    max_tokens: int = MAX_TOKENS_RESPONSE,
-    temperature: float = 0.7,
+    max_tokens: int = FIXED_MAX_TOKENS,
+    temperature: float = FIXED_TEMPERATURE,
     tracker: Optional[_TokenTracker] = None,
     max_retries: int = 4,
 ):
+    """
+    Genera deltas de texto. Si el stream falla ANTES de emitir ningun
+    delta, reintenta. Si falla DESPUES, propaga el error sin reintentar
+    (para no duplicar contenido ya mostrado al usuario).
+    """
     delay = 2.0
     for attempt in range(max_retries):
+        stream = None
+        emitted_any = False
         try:
             stream = client.chat.completions.create(
                 model=model,
@@ -394,28 +500,32 @@ def _call_streaming(
                 if chunk.choices and len(chunk.choices) > 0:
                     delta = chunk.choices[0].delta
                     if delta and getattr(delta, "content", None):
+                        emitted_any = True
                         yield delta.content
                 if tracker is not None and getattr(chunk, "usage", None):
                     tracker.add(chunk.usage)
             return
         except Exception as e:
-            msg = str(e).lower()
-            retriable = any(
-                k in msg
-                for k in (
-                    "429", "rate", "503", "502", "504",
-                    "timeout", "timed out", "overloaded",
-                )
-            )
-            if retriable and attempt < max_retries - 1:
+            if (
+                not emitted_any
+                and _is_retriable_error(e)
+                and attempt < max_retries - 1
+            ):
                 time.sleep(delay + 0.1 * attempt)
                 delay = min(delay * 2, 30)
                 continue
-            raise RuntimeError(f"Error de API tras {attempt+1} intentos: {e}")
-
+            raise RuntimeError(
+                f"Error de API tras {attempt + 1} intentos: {e}"
+            )
+        finally:
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
 
 # ============================================================
-# Utilidades de historial y exportación
+# Historial y exportacion
 # ============================================================
 def _trim_history(
     messages: Sequence[Dict],
@@ -425,7 +535,13 @@ def _trim_history(
         return list(messages)
     system = [m for m in messages if m.get("role") == "system"]
     rest = [m for m in messages if m.get("role") != "system"]
-    return system + rest[-(max_msgs - len(system)):]
+    budget = max(0, max_msgs - len(system))
+    if budget == 0:
+        return system
+    tail = rest[-budget:]
+    while tail and tail[0].get("role") == "assistant":
+        tail = tail[1:]
+    return system + tail
 
 
 def _content_to_str(content: Union[str, List]) -> str:
@@ -448,17 +564,48 @@ def _content_to_str(content: Union[str, List]) -> str:
 
 
 def _export_conversation_json(messages: Sequence[Dict], meta: Dict) -> bytes:
-    serializable = [
-        {"role": m.get("role"), "content": m.get("content")}
-        for m in messages
-    ]
+    serializable = []
+    for m in messages:
+        content = m.get("content")
+        role = m.get("role")
+        if isinstance(content, str):
+            serializable.append({"role": role, "content": content})
+        elif isinstance(content, list):
+            safe_parts = []
+            for p in content:
+                if not isinstance(p, dict):
+                    continue
+                if p.get("type") == "text":
+                    safe_parts.append(
+                        {"type": "text", "text": p.get("text", "")}
+                    )
+                elif p.get("type") == "image_url":
+                    url = ""
+                    iu = p.get("image_url")
+                    if isinstance(iu, dict):
+                        url = iu.get("url", "") or ""
+                    safe_parts.append({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "[imagen omitida del backup]",
+                            "original_length": len(url),
+                        },
+                    })
+            serializable.append({"role": role, "content": safe_parts})
+        else:
+            serializable.append({"role": role, "content": str(content)})
     payload = {"meta": meta, "messages": serializable}
     return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
 
 
 def _export_conversation_markdown(messages: Sequence[Dict], meta: Dict) -> bytes:
+    """
+    Exporta a Markdown. El contenido de cada mensaje se envuelve en un
+    fence para que un '## Usuario' dentro de una respuesta no rompa el
+    documento.
+    """
     lines: List[str] = []
-    lines.append("# Conversación con DeepSeek\n")
+    lines.append("# Conversacion con DeepSeek\n")
     lines.append(f"- Modelo: `{meta.get('model', '?')}`")
     lines.append(f"- Fecha: {meta.get('ts', '?')}")
     lines.append(f"- Tokens totales: {meta.get('tokens_total', 0):,}\n")
@@ -469,17 +616,21 @@ def _export_conversation_markdown(messages: Sequence[Dict], meta: Dict) -> bytes
         if role == "system":
             lines.append(f"**system**: {content}\n")
         elif role == "user":
-            lines.append(f"## 👤 Usuario\n\n{content}\n")
+            lines.append("## Usuario\n")
+            lines.append("````text")
+            lines.append(content)
+            lines.append("````\n")
         elif role == "assistant":
-            lines.append(f"## 🤖 Asistente\n\n{content}\n")
+            lines.append("## Asistente\n")
+            lines.append("````markdown")
+            lines.append(content)
+            lines.append("````\n")
     return "\n".join(lines).encode("utf-8")
 
 
 # ============================================================
-# Renderizado de Markdown / LaTeX / bloques de código
+# Renderizado
 # ============================================================
-
-# Alias de lenguajes → nombre canónico que resalta Streamlit.
 _LANG_ALIASES = {
     "py": "python", "python3": "python",
     "tex": "latex", "latex": "latex",
@@ -495,65 +646,71 @@ _LANG_ALIASES = {
     "r": "r",
 }
 
-_LATEX_INLINE_PAREN = re.compile(r"\\\((.+?)\\\)", re.DOTALL)
-_LATEX_BLOCK_BRACK = re.compile(r"\\\[(.+?)\\\]", re.DOTALL)
-_FENCE_RE = re.compile(r"^(\s*)```([^\n`]*)\n(.*?)\n^\s*```\s*$", re.DOTALL | re.MULTILINE)
+_LATEX_INLINE_PAREN = re.compile(r"\\$(.+?)\\$", re.DOTALL)
+_LATEX_BLOCK_BRACK = re.compile(r"\\$$(.+?)\\$$", re.DOTALL)
+
+_FENCE_RE = re.compile(
+    r"^(\s*)(`{3,}|~{3,})([^\n`~]*)\n(.*?)\n^\s*\2\s*$",
+    re.DOTALL | re.MULTILINE,
+)
+
+_HTML_LIKE_RE = re.compile(
+    r"<\s*/?\s*[a-zA-Z][a-zA-Z0-9]*(\s|>|/)",
+)
+_EVENT_ATTR_RE = re.compile(
+    r"\bon[a-zA-Z]+\s*=",
+    re.IGNORECASE,
+)
 
 
 def _normalize_latex(text: str) -> str:
-    """
-    Convierte delimitadores LaTeX alternativos que el modelo a veces emite
-    (\\( ... \\)  y  \\[ ... \\]) a la forma que Streamlit/KaTeX entiende
-    ($...$ y $$...$$). Protege bloques ```...``` para no tocar su interior.
-    """
     if not text:
         return text
+    marker = f"\x00{uuid.uuid4().hex}_"
     code_blocks: List[str] = []
 
     def _stash(m):
         code_blocks.append(m.group(0))
-        return f"\x00CODE{len(code_blocks)-1}\x00"
+        return f"{marker}{len(code_blocks) - 1}\x00"
 
-    text = re.sub(r"```.*?```", _stash, text, flags=re.DOTALL)
-    text = _LATEX_INLINE_PAREN.sub(lambda m: f"${m.group(1)}$", text)
-    text = _LATEX_BLOCK_BRACK.sub(lambda m: f"$${m.group(1)}$$", text)
+    tmp = re.sub(r"```.*?```", _stash, text, flags=re.DOTALL)
+    tmp = re.sub(r"~~~.*?~~~", _stash, tmp, flags=re.DOTALL)
+    tmp = _LATEX_INLINE_PAREN.sub(lambda m: f"${m.group(1)}$", tmp)
+    tmp = _LATEX_BLOCK_BRACK.sub(lambda m: f"$${m.group(1)}$$", tmp)
     for i, blk in enumerate(code_blocks):
-        text = text.replace(f"\x00CODE{i}\x00", blk)
-    return text
+        tmp = tmp.replace(f"{marker}{i}\x00", blk)
+    return tmp
 
 
 def _guess_fence_language(body: str) -> str:
-    """Heurística para etiquetar un bloque ```sin_lenguaje```."""
-    if re.search(r"^\s*(def |class |import |from \w+ import |print\()", body, re.MULTILINE):
+    s = body.lstrip()
+    if not s:
+        return "text"
+    if s.startswith(("def ", "import ", "from ", "class ", "#!")):
         return "python"
-    if re.search(r"\\(documentclass|begin\{|end\{|frac|sqrt|sum_|int_)", body):
-        return "latex"
-    if re.search(r"^\s*(#!/bin/(ba)?sh|sudo |apt(-get)? |pip |\$ )", body, re.MULTILINE):
-        return "bash"
-    if re.search(r"^\s*\{[\s\S]*\}\s*$", body) and '"' in body:
-        return "json"
-    if re.search(r"^\s*[-\w]+\s*:\s*.+$", body, re.MULTILINE) and ":" in body:
-        return "yaml"
-    if re.search(r"^\s*<[\w!?]", body, re.MULTILINE):
-        return "html"
-    if re.search(r"^\s*(SELECT|INSERT|UPDATE|DELETE|CREATE|DROP)\b", body, re.IGNORECASE):
+    if s.startswith(("SELECT ", "INSERT ", "UPDATE ", "DELETE ", "CREATE ")):
         return "sql"
+    if s.startswith(("<?xml", "<!DOCTYPE", "<html")):
+        return "html"
+    if s.startswith(("{", "[")):
+        return "json"
+    if s.startswith(("$ ", "sudo ", "apt ", "pip ", "npm ", "git ")):
+        return "bash"
+    if "\\begin{" in body or "\\end{" in body:
+        return "latex"
     return "text"
 
 
 def _normalize_fences(text: str) -> str:
-    """
-    Garantiza que cada bloque de código tenga un lenguaje correcto.
-    - Normaliza alias (py→python, tex→latex, sh→bash, etc.).
-    - Si un bloque no tiene lenguaje, lo adivina por heurística.
-    """
-    if "```" not in text:
+    if not text:
+        return text
+    if "```" not in text and "~~~" not in text:
         return text
 
     def _fix(m: re.Match) -> str:
         indent = m.group(1) or ""
-        raw_lang = (m.group(2) or "").strip().lower()
-        body = m.group(3)
+        raw_lang = (m.group(3) or "").strip().lower()
+        body = m.group(4)
         lang = _LANG_ALIASES.get(raw_lang, raw_lang)
         if not lang:
             lang = _guess_fence_language(body)
@@ -562,90 +719,115 @@ def _normalize_fences(text: str) -> str:
     return _FENCE_RE.sub(_fix, text)
 
 
-# Etiquetas de HTML potencialmente peligroso que el modelo podría colar.
-_DANGEROUS_HTML_RE = re.compile(
-    r"<\s*(script|iframe|object|embed|style|link|meta|form|input)\b",
-    re.IGNORECASE,
-)
-_EVENT_ATTR_RE = re.compile(r"\son\w+\s*=", re.IGNORECASE)
+_HEADING_RE = re.compile(r"^(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$", re.MULTILINE)
 
 
-def _strip_dangerous_html(text: str) -> str:
-    """
-    Si el modelo devuelve etiquetas HTML peligrosas (script/iframe/onerror=…),
-    las neutralizamos mostrándolas dentro de un bloque ```html para que se
-    vean como texto, no se ejecuten. No escapamos el resto: Markdown normal
-    sigue funcionando y LaTeX sigue intacto.
-    """
+def _flatten_headings(text: str) -> str:
     if not text:
         return text
-    if not (_DANGEROUS_HTML_RE.search(text) or _EVENT_ATTR_RE.search(text)):
-        return text
-
-    # Sacamos los bloques ```...``` y los preservamos tal cual.
+    marker = f"\x00{uuid.uuid4().hex}_"
     preserved: List[str] = []
 
     def _stash(m):
         preserved.append(m.group(0))
-        return f"\x00PRES{len(preserved)-1}\x00"
+        return f"{marker}{len(preserved) - 1}\x00"
 
     tmp = re.sub(r"```.*?```", _stash, text, flags=re.DOTALL)
+    tmp = re.sub(r"~~~.*?~~~", _stash, tmp, flags=re.DOTALL)
+    tmp = re.sub(r"\$\$.*?\$\$", _stash, tmp, flags=re.DOTALL)
+    tmp = re.sub(r"(?<!\$)\$(?!\$)[^$\n]+?\$(?!\$)", _stash, tmp)
 
-    # Envolvemos las líneas con HTML peligroso en un fence ```html.
-    lines = tmp.splitlines()
-    out_lines: List[str] = []
-    in_html_block = False
-    for ln in lines:
-        if _DANGEROUS_HTML_RE.search(ln) or _EVENT_ATTR_RE.search(ln):
-            if not in_html_block:
-                out_lines.append("```html")
-                in_html_block = True
-            out_lines.append(ln)
-        else:
-            if in_html_block:
-                out_lines.append("```")
-                in_html_block = False
-            out_lines.append(ln)
-    if in_html_block:
-        out_lines.append("```")
-    tmp = "\n".join(out_lines)
+    def _to_bold(m: re.Match) -> str:
+        title = m.group(2).strip()
+        return f"**{title}**"
 
+    tmp = _HEADING_RE.sub(_to_bold, tmp)
     for i, blk in enumerate(preserved):
-        tmp = tmp.replace(f"\x00PRES{i}\x00", blk)
+        tmp = tmp.replace(f"{marker}{i}\x00", blk)
     return tmp
 
 
-def _prepare_for_render(text: str) -> str:
-    """Pipeline completo de saneado antes de st.markdown."""
+def _escape_html_outside_fences(text: str) -> str:
+    if not text:
+        return text
+    if not (_HTML_LIKE_RE.search(text) or _EVENT_ATTR_RE.search(text)):
+        return text
+    marker = f"\x00{uuid.uuid4().hex}_"
+    preserved: List[str] = []
+
+    def _stash(m):
+        preserved.append(m.group(0))
+        return f"{marker}{len(preserved) - 1}\x00"
+
+    tmp = re.sub(r"```.*?```", _stash, text, flags=re.DOTALL)
+    tmp = re.sub(r"~~~.*?~~~", _stash, tmp, flags=re.DOTALL)
+    tmp = re.sub(r"\$\$.*?\$\$", _stash, tmp, flags=re.DOTALL)
+    tmp = re.sub(r"(?<!\$)\$(?!\$)[^$\n]+?\$(?!\$)", _stash, tmp)
+    tmp = html.escape(tmp, quote=False)
+    for i, blk in enumerate(preserved):
+        tmp = tmp.replace(f"{marker}{i}\x00", blk)
+    return tmp
+
+
+def _prepare_for_render(text: str, flatten_headings: bool = True) -> str:
     text = _normalize_latex(text)
     text = _normalize_fences(text)
-    text = _strip_dangerous_html(text)
+    if flatten_headings:
+        text = _flatten_headings(text)
+    text = _escape_html_outside_fences(text)
     return text
 
 
-def _render_markdown_safe(text: str, *, allow_html: bool = False) -> None:
+def _render_markdown_safe(text: str, flatten_headings: bool = True) -> None:
+    if not text:
+        return
+    st.markdown(
+        _prepare_for_render(text, flatten_headings=flatten_headings),
+        unsafe_allow_html=False,
+    )
+
+
+def _show_response_text(text: str) -> None:
     """
-    Renderiza texto del chat:
-      - Markdown estándar.
-      - Bloques ```python / ```latex / ```bash con resaltado nativo.
-      - LaTeX nativo (KaTeX) para $...$ y $$...$$.
-      - Por defecto NO interpreta HTML crudo del modelo.
+    Muestra la respuesta en un expander con st.code (que ya trae boton
+    de copiar nativo). Antes se llamaba _render_copy_button pero no
+    copiaba nada.
     """
     if not text:
         return
-    st.markdown(_prepare_for_render(text), unsafe_allow_html=allow_html)
-
-
-def _render_plain_copyable(text: str, label: str = "📋 Copiar") -> None:
-    """Bloque nativo copiable que preserva Unicode y LaTeX tal cual."""
-    with st.expander(label, expanded=False):
+    with st.expander("Ver / copiar respuesta", expanded=False):
         st.code(text, language="text")
 
+
+def _self_test_latex() -> Tuple[bool, str]:
+    try:
+        sample = (
+            r"Inline: \(a^2 + b^2 = c^2\)" + "\n\n"
+            + "Bloque:\n"
+            + r"\[" + "\n"
+            + r"\int_0^1 x^2 dx = 1/3" + "\n"
+            + r"\]" + "\n"
+        )
+        out = _normalize_latex(sample)
+        if "$a^2 + b^2 = c^2$" not in out:
+            return False, "No se convirtio \\(...\\) a $...$"
+        if "$$" not in out:
+            return False, "No se convirtio \\[...\\] a $$...$$"
+        return True, "OK: delimitadores alternativos convertidos"
+    except Exception as e:
+        return False, f"Excepcion en _normalize_latex: {e}"
+
+
 # ============================================================
-# CONEXIÓN SFTP Y GESTIÓN DE RESPALDOS EN SERVIDOR REMOTO
+# SFTP y respaldos
 # ============================================================
 def _sftp_connect():
-    rs = st.secrets["remote_server"]
+    rs = _get_remote_server_cfg()
+    if not rs:
+        raise RuntimeError(
+            "Falta la seccion [remote_server] en secrets.toml "
+            "(host, port, user, private_key, dir_chat) o dir_chat es invalido."
+        )
     transport = paramiko.Transport((rs["host"], int(rs["port"])))
     key = paramiko.Ed25519Key.from_private_key(StringIO(rs["private_key"]))
     transport.connect(username=rs["user"], pkey=key)
@@ -654,12 +836,19 @@ def _sftp_connect():
 
 
 def _remote_path(filename: str) -> str:
-    rs = st.secrets["remote_server"]
+    rs = _get_remote_server_cfg()
+    if not rs:
+        raise RuntimeError("Falta [remote_server] en secrets.toml.")
     return f"{rs['dir_chat'].rstrip('/')}/{filename}"
 
 
-def _ensure_remote_dir(sftp, path: str):
-    parts = path.rstrip("/").split("/")
+def _ensure_remote_dir(sftp, path: str) -> None:
+    if not path.startswith("/"):
+        raise RuntimeError(f"Ruta remota no absoluta: {path!r}")
+    norm = posixpath.normpath(path)
+    if ".." in norm.split("/"):
+        raise RuntimeError(f"Ruta remota contiene '..': {path!r}")
+    parts = norm.rstrip("/").split("/")
     current = ""
     for p in parts:
         if not p:
@@ -670,19 +859,73 @@ def _ensure_remote_dir(sftp, path: str):
         except IOError:
             try:
                 sftp.mkdir(current)
-            except OSError:
-                pass
+            except OSError as e:
+                raise RuntimeError(
+                    f"No se pudo crear el directorio remoto '{current}': {e}"
+                ) from e
 
 
 def _backup_dir() -> str:
-    rs = st.secrets["remote_server"]
+    rs = _get_remote_server_cfg()
+    if not rs:
+        raise RuntimeError("Falta [remote_server] en secrets.toml.")
     return f"{rs['dir_chat'].rstrip('/')}/backups"
 
 
 def _safe_backup_timestamp(ts: str) -> str:
     if not re.fullmatch(r"\d{8}_\d{6}", ts):
-        raise ValueError(f"Timestamp inválido: {ts}")
+        raise ValueError(f"Timestamp invalido: {ts}")
     return ts
+
+
+_TS_SUFFIX_RE = re.compile(r"^\d{8}_\d{6}(_[0-9a-f]{4})?$")
+
+
+def _safe_backup_timestamp_ext(ts: str) -> str:
+    if not _TS_SUFFIX_RE.fullmatch(ts):
+        raise ValueError(f"Timestamp invalido: {ts}")
+    return ts
+
+
+def _remote_backup_exists(sftp, bdir: str, ts: str) -> bool:
+    try:
+        sftp.stat(f"{bdir}/chat_backup_{ts}.json")
+        return True
+    except IOError:
+        return False
+
+
+def _pick_unique_timestamp(sftp, bdir: str, base_ts: str) -> str:
+    if not _remote_backup_exists(sftp, bdir, base_ts):
+        return base_ts
+    for _ in range(5):
+        candidate = f"{base_ts}_{uuid.uuid4().hex[:4]}"
+        if not _remote_backup_exists(sftp, bdir, candidate):
+            return candidate
+    raise RuntimeError(
+        f"No se pudo encontrar un timestamp libre para {base_ts} "
+        f"tras 5 intentos."
+    )
+
+
+def _is_regular_remote_file(sftp, path: str) -> bool:
+    try:
+        stt = sftp.lstat(path)
+        return stat_module.S_ISREG(stt.st_mode)
+    except Exception:
+        return False
+
+
+_TITLE_ESCAPE_MAP = {"&": "&", "<": "<", ">": ">"}
+
+
+def _sanitize_title_for_storage(title: str) -> str:
+    t = title or ""
+    t = re.sub(r"[\x00-\x1f\x7f]", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    for k, v in _TITLE_ESCAPE_MAP.items():
+        t = t.replace(k, v)
+    return t[:200]
 
 
 def upload_backup_to_server(
@@ -690,93 +933,111 @@ def upload_backup_to_server(
     json_bytes: bytes,
     md_bytes: bytes,
     chat_title: str = "",
-) -> Tuple[bool, str]:
+) -> Tuple[bool, str, str]:
     try:
-        ts = _safe_backup_timestamp(timestamp)
+        base_ts = _safe_backup_timestamp(timestamp)
         transport, sftp = _sftp_connect()
-        bdir = _backup_dir()
-        _ensure_remote_dir(sftp, bdir)
-
-        json_name = f"chat_backup_{ts}.json"
-        md_name = f"chat_backup_{ts}.md"
-
-        with sftp.open(f"{bdir}/{json_name}", "wb") as f:
-            f.write(json_bytes)
-        with sftp.open(f"{bdir}/{md_name}", "wb") as f:
-            f.write(md_bytes)
-
-        if chat_title:
-            meta_name = f"chat_backup_{ts}.title"
-            with sftp.open(f"{bdir}/{meta_name}", "wb") as f:
-                f.write(chat_title[:200].encode("utf-8"))
-
-        sftp.close()
-        transport.close()
-        return True, f"Respaldos subidos: {json_name}"
+        try:
+            bdir = _backup_dir()
+            _ensure_remote_dir(sftp, bdir)
+            ts = _pick_unique_timestamp(sftp, bdir, base_ts)
+            json_name = f"chat_backup_{ts}.json"
+            md_name = f"chat_backup_{ts}.md"
+            with sftp.open(f"{bdir}/{json_name}", "wb") as f:
+                f.write(json_bytes)
+            with sftp.open(f"{bdir}/{md_name}", "wb") as f:
+                f.write(md_bytes)
+            if chat_title:
+                meta_name = f"chat_backup_{ts}.title"
+                safe_title = _sanitize_title_for_storage(chat_title)
+                with sftp.open(f"{bdir}/{meta_name}", "wb") as f:
+                    f.write(safe_title.encode("utf-8"))
+            return True, f"Respaldos subidos: {json_name}", ts
+        finally:
+            try:
+                sftp.close()
+            except Exception:
+                pass
+            try:
+                transport.close()
+            except Exception:
+                pass
     except Exception as e:
-        return False, f"Error al subir respaldos: {e}"
+        return False, f"Error al subir respaldos: {e}", timestamp
 
 
-def list_remote_backups() -> List[Dict]:
+def _list_remote_backups_uncached() -> List[Dict]:
     backups: List[Dict] = []
     try:
         transport, sftp = _sftp_connect()
-        bdir = _backup_dir()
         try:
-            files = sftp.listdir_attr(bdir)
-        except IOError:
-            sftp.close()
-            transport.close()
-            return []
-
-        grouped: Dict[str, Dict] = {}
-        for f in files:
-            m = re.match(
-                r"chat_backup_(\d{8}_\d{6})\.(json|md|title)$",
-                f.filename,
-            )
-            if not m:
-                continue
-            ts, ext = m.group(1), m.group(2)
-            grouped.setdefault(
-                ts,
-                {"timestamp": ts, "json": None, "md": None, "title": ""},
-            )
-            if ext == "json":
-                grouped[ts]["json"] = f.filename
-                grouped[ts]["size"] = f.st_size
-            elif ext == "md":
-                grouped[ts]["md"] = f.filename
-            elif ext == "title":
-                try:
-                    with sftp.open(f"{bdir}/{f.filename}", "r") as tf:
-                        grouped[ts]["title"] = tf.read().decode(
-                            "utf-8", errors="replace"
-                        )
-                except Exception:
-                    pass
-
-        for ts, info in grouped.items():
-            if not info.get("json"):
-                continue
+            bdir = _backup_dir()
             try:
-                dt = datetime.datetime.strptime(ts, "%Y%m%d_%H%M%S")
-                human = dt.strftime("%Y-%m-%d %H:%M:%S")
-            except Exception:
-                human = ts
-            title = (info.get("title") or "").strip() or "(sin título)"
-            size_kb = (info.get("size", 0) or 0) / 1024
-            backups.append({
-                "timestamp": ts,
-                "json_file": info["json"],
-                "md_file": info.get("md"),
-                "title": title,
-                "display": f"{human} — {title} ({size_kb:.1f} KB)",
-                "size": info.get("size", 0),
-            })
+                files = sftp.listdir_attr(bdir)
+            except IOError:
+                return []
 
-        sftp.close()
-        transport.close()
+            grouped: Dict[str, Dict] = {}
+            for f in files:
+                m = re.match(
+                    r"chat_backup_(\d{8}_\d{6}(?:_[0-9a-f]{4})?)\.(json|md|title)$",
+                    f.filename,
+                )
+                if not m:
+                    continue
+                ts, ext = m.group(1), m.group(2)
+                full_path = f"{bdir}/{f.filename}"
+                if not _is_regular_remote_file(sftp, full_path):
+                    continue
+                grouped.setdefault(
+                    ts,
+                    {"timestamp": ts, "json": None, "md": None, "title": ""},
+                )
+                if ext == "json":
+                    grouped[ts]["json"] = f.filename
+                    grouped[ts]["size"] = f.st_size
+                elif ext == "md":
+                    grouped[ts]["md"] = f.filename
+                elif ext == "title":
+                    try:
+                        with sftp.open(full_path, "r") as tf:
+                            raw = tf.read()
+                            if isinstance(raw, bytes):
+                                raw = raw.decode("utf-8", errors="replace")
+                            grouped[ts]["title"] = raw
+                    except Exception:
+                        pass
+
+            for ts, info in grouped.items():
+                if not info.get("json"):
+                    continue
+                base_for_display = ts[:15] if len(ts) >= 15 else ts
+                try:
+                    dt = datetime.datetime.strptime(
+                        base_for_display, "%Y%m%d_%H%M%S"
+                    )
+                    human = dt.strftime("%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    human = ts
+                title = (info.get("title") or "").strip() or "(sin titulo)"
+                size_kb = (info.get("size", 0) or 0) / 1024
+                backups.append({
+                    "timestamp": ts,
+                    "json_file": info["json"],
+                    "md_file": info.get("md"),
+                    "title": title,
+                    "display": f"{human} - {title} ({size_kb:.1f} KB)",
+                    "size": info.get("size", 0),
+                })
+        finally:
+            try:
+                sftp.close()
+            except Exception:
+                pass
+            try:
+                transport.close()
+            except Exception:
+                pass
     except Exception as e:
         st.error(f"Error al listar respaldos: {e}")
         return []
@@ -784,15 +1045,51 @@ def list_remote_backups() -> List[Dict]:
     return sorted(backups, key=lambda x: x["timestamp"], reverse=True)
 
 
+@st.cache_data(ttl=30, show_spinner=False)
+def _list_remote_backups_cached(_cache_buster: int = 0) -> List[Dict]:
+    """
+    Cache de 30s. El parametro _cache_buster permite forzar refresco
+    incrementandolo desde la UI.
+    """
+    return _list_remote_backups_uncached()
+
+
+def list_remote_backups(force_refresh: bool = False) -> List[Dict]:
+    if force_refresh:
+        st.session_state["_backup_cache_buster"] = (
+            int(st.session_state.get("_backup_cache_buster", 0)) + 1
+        )
+    buster = int(st.session_state.get("_backup_cache_buster", 0))
+    return _list_remote_backups_cached(buster)
+
+
 def download_backup_from_server(filename: str) -> Optional[bytes]:
+    if not re.fullmatch(
+        r"chat_backup_\d{8}_\d{6}(?:_[0-9a-f]{4})?\.(json|md|title)",
+        filename,
+    ):
+        st.error(f"Nombre de archivo no permitido: {filename}")
+        return None
     try:
         transport, sftp = _sftp_connect()
-        bdir = _backup_dir()
-        with sftp.open(f"{bdir}/{filename}", "rb") as f:
-            data = f.read()
-        sftp.close()
-        transport.close()
-        return data
+        try:
+            bdir = _backup_dir()
+            full_path = f"{bdir}/{filename}"
+            if not _is_regular_remote_file(sftp, full_path):
+                st.error(f"El archivo {filename} no es un archivo regular.")
+                return None
+            with sftp.open(full_path, "rb") as f:
+                data = f.read()
+            return data
+        finally:
+            try:
+                sftp.close()
+            except Exception:
+                pass
+            try:
+                transport.close()
+            except Exception:
+                pass
     except Exception as e:
         st.error(f"Error al descargar {filename}: {e}")
         return None
@@ -800,91 +1097,182 @@ def download_backup_from_server(filename: str) -> Optional[bytes]:
 
 def delete_backup_from_server(timestamp: str) -> Tuple[bool, str]:
     try:
-        ts = _safe_backup_timestamp(timestamp)
+        ts = _safe_backup_timestamp_ext(timestamp)
         transport, sftp = _sftp_connect()
-        bdir = _backup_dir()
-        deleted = 0
-        for ext in ("json", "md", "title"):
-            path = f"{bdir}/chat_backup_{ts}.{ext}"
+        try:
+            bdir = _backup_dir()
+            deleted = 0
+            for ext in ("json", "md", "title"):
+                path = f"{bdir}/chat_backup_{ts}.{ext}"
+                if not _is_regular_remote_file(sftp, path):
+                    continue
+                try:
+                    sftp.remove(path)
+                    deleted += 1
+                except IOError:
+                    pass
+            return True, f"Eliminados {deleted} archivo(s)."
+        finally:
             try:
-                sftp.remove(path)
-                deleted += 1
-            except IOError:
+                sftp.close()
+            except Exception:
                 pass
-        sftp.close()
-        transport.close()
-        return True, f"Eliminados {deleted} archivo(s)."
+            try:
+                transport.close()
+            except Exception:
+                pass
     except Exception as e:
         return False, f"Error al eliminar: {e}"
 
 
+_TITLE_MAX_LEN = 60
+_TITLE_STRIP_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
 def _derive_title_from_messages(
     messages: Sequence[Dict],
-    max_len: int = 60,
+    max_len: int = _TITLE_MAX_LEN,
 ) -> str:
     for m in messages:
         if m.get("role") == "user":
             txt = _content_to_str(m.get("content", "")).strip()
-            txt = re.sub(r"\s+", " ", txt)
+            txt = _TITLE_STRIP_RE.sub(" ", txt)
+            txt = re.sub(r"\s+", " ", txt).strip()
             if txt:
-                return txt[:max_len] + ("…" if len(txt) > max_len else "")
+                raw = txt[:max_len] + ("..." if len(txt) > max_len else "")
+                # Sanitizamos igual que al guardar, para que el titulo
+                # mostrado y el almacenado sean coherentes.
+                return _sanitize_title_for_storage(raw)
     return datetime.datetime.now().strftime("Chat del %Y-%m-%d %H:%M")
 
 
 # ============================================================
-# CARGA DE UN RESPALDO EN LA SESIÓN ACTUAL
+# Carga de un respaldo en la sesion actual
 # ============================================================
+_VALID_ROLES = {"system", "user", "assistant"}
+_VALID_PART_TYPES = {"text", "image_url"}
+
+_MAX_BACKUP_MESSAGES = 500
+_MAX_BACKUP_TOTAL_BYTES = 20 * 1024 * 1024
+
+_ALLOWED_IMAGE_URL_SCHEMES = ("data:", "http://", "https://")
+
+
+def _validate_messages(msgs) -> Tuple[bool, str]:
+    if not isinstance(msgs, list):
+        return False, "messages no es lista"
+    if len(msgs) > _MAX_BACKUP_MESSAGES:
+        return False, (
+            f"Backup con demasiados mensajes: {len(msgs)} "
+            f"(max {_MAX_BACKUP_MESSAGES})"
+        )
+    total_bytes = 0
+    for m in msgs:
+        if not isinstance(m, dict):
+            return False, "mensaje no es dict"
+        if m.get("role") not in _VALID_ROLES:
+            return False, f"role invalido: {m.get('role')!r}"
+        c = m.get("content")
+        if not isinstance(c, (str, list)):
+            return False, "content debe ser str o list"
+        if isinstance(c, str):
+            total_bytes += len(c.encode("utf-8", errors="ignore"))
+        elif isinstance(c, list):
+            for p in c:
+                if not isinstance(p, dict):
+                    return False, "parte no es dict"
+                if p.get("type") not in _VALID_PART_TYPES:
+                    return False, f"tipo de parte invalido: {p.get('type')!r}"
+                if p.get("type") == "text":
+                    t = p.get("text")
+                    if not isinstance(t, str):
+                        return False, "text debe ser str"
+                    total_bytes += len(t.encode("utf-8", errors="ignore"))
+                elif p.get("type") == "image_url":
+                    iu = p.get("image_url")
+                    if not isinstance(iu, dict):
+                        return False, "image_url debe ser dict"
+                    url = iu.get("url")
+                    if not isinstance(url, str):
+                        return False, "image_url.url debe ser str"
+                    if not url.startswith(_ALLOWED_IMAGE_URL_SCHEMES):
+                        return False, (
+                            f"image_url.url con esquema no permitido: "
+                            f"{url[:32]!r}"
+                        )
+                    total_bytes += len(url)
+        if total_bytes > _MAX_BACKUP_TOTAL_BYTES:
+            return False, (
+                f"Backup excede {_MAX_BACKUP_TOTAL_BYTES // (1024 * 1024)} MB"
+            )
+    return True, "OK"
+
+
 def load_backup_into_session(json_bytes: bytes) -> Tuple[bool, str]:
     try:
         payload = json.loads(json_bytes.decode("utf-8"))
     except Exception as e:
-        return False, f"JSON inválido: {e}"
+        return False, f"JSON invalido: {e}"
+
+    if not isinstance(payload, dict):
+        return False, "El JSON no es un objeto valido."
 
     messages = payload.get("messages", [])
     meta = payload.get("meta", {})
-    if not isinstance(messages, list):
-        return False, "El JSON no contiene una lista de mensajes válida."
+    if not isinstance(meta, dict):
+        meta = {}
+
+    ok, reason = _validate_messages(messages)
+    if not ok:
+        return False, f"Backup invalido: {reason}"
+
+    messages = [m for m in messages if m.get("role") != "system"]
+    messages.insert(0, {
+        "role": "system",
+        "content": DEFAULT_SYSTEM_PROMPT,
+    })
+
+    raw_tokens = meta.get("tokens_total", 0)
+    try:
+        tokens_total = int(raw_tokens)
+        if tokens_total < 0:
+            tokens_total = 0
+    except Exception:
+        tokens_total = 0
 
     st.session_state.messages = messages
     st.session_state.conversation_meta = {
         "ts": meta.get("ts") or datetime.datetime.now().strftime("%Y%m%d_%H%M%S"),
         "model": meta.get("model", DEFAULT_MODEL),
-        "tokens_total": meta.get("tokens_total", 0),
+        "tokens_total": tokens_total,
     }
     st.session_state.tracker.reset()
-    if isinstance(meta.get("tokens_total"), int):
-        st.session_state.tracker.completion = meta["tokens_total"]
-    st.session_state["_scroll_to_bottom"] = True
+    if tokens_total > 0:
+        st.session_state.tracker.completion = tokens_total
     st.session_state["_turn_counter"] = len(messages)
     return True, f"Cargados {len(messages)} mensaje(s) del respaldo."
 
-
 # ============================================================
-# CSS GLOBAL — no rompe LaTeX de bloque, no inyecta HTML del modelo
+# CSS global
 # ============================================================
 _GLOBAL_CSS = """
 <style>
-/* Solo forzamos el wrap en bloques de código, NO en párrafos:
-   white-space:pre-wrap sobre .stMarkdown rompe $$...$$ en KaTeX. */
-.assistant-msg-wrap pre,
-.assistant-msg-wrap pre code,
-.assistant-msg-wrap code {
+[data-testid="stChatMessage"] pre,
+[data-testid="stChatMessage"] pre code,
+[data-testid="stChatMessage"] code {
     white-space: pre-wrap !important;
     word-wrap: break-word !important;
     overflow-wrap: break-word !important;
     max-width: 100% !important;
+    font-size: 0.95em !important;
 }
-
-/* Bloques KaTeX no deben desbordar el contenedor. */
 .katex-display,
 .katex {
     max-width: 100% !important;
     overflow-x: auto;
     overflow-y: hidden;
 }
-
-/* El texto normal fluye como Markdown normal. */
-.assistant-msg-wrap p {
+[data-testid="stChatMessage"] p {
     white-space: normal !important;
     overflow-wrap: break-word;
 }
@@ -899,7 +1287,31 @@ def _inject_global_css() -> None:
 
 
 # ============================================================
-# Interfaz Streamlit — inicialización y utilidades de render
+# Autoscroll real (JS)
+# ============================================================
+def _inject_autoscroll() -> None:
+    """
+    Hace scroll al final del chat. Se ejecuta en cada rerun; el
+    componente es invisible y no interfiere con el layout.
+    """
+    st.components.v1.html(
+        """
+        <script>
+        (function() {
+            const doc = window.parent.document;
+            const main = doc.querySelector('section.main');
+            if (main) {
+                main.scrollTo({top: main.scrollHeight, behavior: 'smooth'});
+            }
+        })();
+        </script>
+        """,
+        height=0,
+    )
+
+
+# ============================================================
+# Inicializacion de sesion
 # ============================================================
 def _init_session_state() -> None:
     if "messages" not in st.session_state:
@@ -911,22 +1323,17 @@ def _init_session_state() -> None:
         st.session_state.logger = logger
         st.session_state.run_id = run_id
         st.session_state.log_path = log_path
+        # Volcamos warnings de secretos acumulados antes del logger.
+        for w in st.session_state.get("_secret_warnings", []):
+            _log(logger, event="secret_warning", detail=w)
     if "conversation_meta" not in st.session_state:
         st.session_state.conversation_meta = {
             "ts": datetime.datetime.now().strftime("%Y%m%d_%H%M%S"),
             "model": DEFAULT_MODEL,
             "tokens_total": 0,
         }
-    if "system_prompt" not in st.session_state:
-        st.session_state.system_prompt = ""
-    if "balance_cache" not in st.session_state:
-        st.session_state.balance_cache = None
-    if "balance_last_check" not in st.session_state:
-        st.session_state.balance_last_check = None
     if "show_uploader" not in st.session_state:
         st.session_state.show_uploader = False
-    if "_scroll_to_bottom" not in st.session_state:
-        st.session_state["_scroll_to_bottom"] = False
     if "_turn_counter" not in st.session_state:
         st.session_state["_turn_counter"] = 0
     if "_uploader_key" not in st.session_state:
@@ -935,10 +1342,31 @@ def _init_session_state() -> None:
         st.session_state["show_backups"] = False
     if "_css_injected" not in st.session_state:
         st.session_state["_css_injected"] = False
+    if "_run_self_tests" not in st.session_state:
+        st.session_state["_run_self_tests"] = False
+    if "_ephemeral_texts" not in st.session_state:
+        st.session_state["_ephemeral_texts"] = {}
+    if "_ephemeral_images" not in st.session_state:
+        st.session_state["_ephemeral_images"] = {}
+    if "_seen_uploads" not in st.session_state:
+        st.session_state["_seen_uploads"] = set()
+    if "_backup_cache_buster" not in st.session_state:
+        st.session_state["_backup_cache_buster"] = 0
+    if "flatten_headings" not in st.session_state:
+        st.session_state["flatten_headings"] = DEFAULT_FLATTEN_HEADINGS
+
+    if not any(m.get("role") == "system" for m in st.session_state.messages):
+        st.session_state.messages.insert(0, {
+            "role": "system",
+            "content": DEFAULT_SYSTEM_PROMPT,
+        })
 
 
 def _reset_conversation() -> None:
-    st.session_state.messages = []
+    st.session_state.messages = [{
+        "role": "system",
+        "content": DEFAULT_SYSTEM_PROMPT,
+    }]
     st.session_state.tracker.reset()
     logger, run_id, log_path = _setup_run_logger()
     st.session_state.logger = logger
@@ -946,22 +1374,22 @@ def _reset_conversation() -> None:
     st.session_state.log_path = log_path
     st.session_state.conversation_meta = {
         "ts": datetime.datetime.now().strftime("%Y%m%d_%H%M%S"),
-        "model": st.session_state.get("model_input", DEFAULT_MODEL),
+        "model": DEFAULT_MODEL,
         "tokens_total": 0,
     }
     st.session_state["_turn_counter"] = 0
-    st.session_state["_scroll_to_bottom"] = False
     st.session_state["_uploader_key"] += 1
+    st.session_state["_ephemeral_texts"] = {}
+    st.session_state["_ephemeral_images"] = {}
+    st.session_state["_seen_uploads"] = set()
+    st.session_state.show_uploader = False
     _log(st.session_state.logger, event="conversation_reset")
 
 
+# ============================================================
+# Render de mensajes
+# ============================================================
 def _render_message(role: str, content: Union[str, List]) -> None:
-    """
-    Renderiza un mensaje del historial:
-      - Texto normal → Markdown sin HTML (LaTeX y fences nativos).
-      - ```python / ```latex / ```bash con resaltado correcto.
-      - Nunca inyecta HTML del modelo.
-    """
     if isinstance(content, list):
         text_parts = [
             p.get("text", "") for p in content
@@ -977,129 +1405,63 @@ def _render_message(role: str, content: Union[str, List]) -> None:
     else:
         text = content or ""
 
+    flatten = bool(st.session_state.get("flatten_headings", True))
+
     if role == "user":
         with st.chat_message("user", avatar="👤"):
-            _render_markdown_safe(text)
+            _render_markdown_safe(text, flatten_headings=flatten)
     elif role == "assistant":
         with st.chat_message("assistant", avatar="🤖"):
-            _render_markdown_safe(text)
-            _render_plain_copyable(text)
+            _render_markdown_safe(text, flatten_headings=flatten)
     elif role == "system":
-        with st.chat_message("system", avatar="⚙️"):
-            st.markdown(f"**[system]** {text}")
+        return
+
 
 # ============================================================
-# Sidebar
+# Sidebar: controles (devuelve cfg)
 # ============================================================
-def _render_sidebar() -> Dict:
+def _render_sidebar_controls() -> Dict:
     with st.sidebar:
-        st.header("⚙️ Configuración")
+        st.header("Configuracion")
 
         api_key = st.text_input(
             "DeepSeek API Key",
-            value=FALLBACK_DEEPSEEK_KEY,
+            value=_get_api_key_fallback(),
             type="password",
             key="api_key_input",
-            help="Se usa solo en esta sesión. No se persiste en disco.",
+            help="Se usa solo en esta sesion. No se persiste en disco.",
         )
         base_url = st.text_input(
             "Base URL",
             value=DEFAULT_BASE_URL,
             key="base_url_input",
         )
-        model = st.selectbox(
-            "Modelo",
-            options=AVAILABLE_MODELS,
-            index=0,
-            key="model_input",
-        )
-        temperature = st.slider(
-            "Temperatura",
-            min_value=0.0, max_value=2.0, value=0.7, step=0.1,
-            key="temperature_input",
-        )
-        max_tokens = st.number_input(
-            "Máx. tokens por respuesta",
-            min_value=256, max_value=8192,
-            value=MAX_TOKENS_RESPONSE, step=256,
-            key="max_tokens_input",
+
+        st.checkbox(
+            "Aplanar headings (# -> **negrita**)",
+            key="flatten_headings",
+            help=(
+                "Convierte '# Titulo' en '**Titulo**'. Util si los "
+                "headings de Streamlit se ven mal dentro del chat."
+            ),
         )
 
-        with st.expander("System prompt (opcional)"):
-            st.caption(
-                "Si lo dejas vacío, se usa un prompt por defecto que pide "
-                "bloques ```python / ```latex / ```bash y prohíbe HTML."
-            )
-            system_prompt = st.text_area(
-                "Instrucciones de sistema",
-                value=st.session_state.system_prompt,
-                height=120,
-                key="system_prompt_input",
-                placeholder=(
-                    "Ejemplo: Eres un asistente experto en matemática "
-                    "computacional. Devuelve código en bloques ```python "
-                    "y fórmulas en LaTeX."
-                ),
-            )
-            if st.button("Aplicar system prompt", use_container_width=True):
-                st.session_state.system_prompt = system_prompt.strip()
-                st.session_state.messages = [
-                    m for m in st.session_state.messages
-                    if m.get("role") != "system"
-                ]
-                effective = (
-                    st.session_state.system_prompt or DEFAULT_SYSTEM_PROMPT
-                )
-                st.session_state.messages.insert(0, {
-                    "role": "system",
-                    "content": effective,
-                })
-                st.success("System prompt aplicado.")
+        return {
+            "api_key": api_key.strip(),
+            "base_url": base_url.strip(),
+        }
 
+
+# ============================================================
+# Sidebar: acciones (botones que mutan estado)
+# ============================================================
+def _render_sidebar_actions() -> None:
+    with st.sidebar:
         st.divider()
-        st.subheader("📊 Estado")
-
-        tracker: _TokenTracker = st.session_state.tracker
-        col_a, col_b = st.columns(2)
-        col_a.metric("Mensajes", len(st.session_state.messages))
-        col_b.metric("Tokens", f"{tracker.total:,}")
-        st.progress(
-            min(tracker.total / tracker.budget, 1.0),
-            text=f"{tracker.total:,} / {tracker.budget:,} tokens",
-        )
-        if tracker.over_budget():
-            st.code(
-                "[ERROR] Presupuesto de tokens excedido.",
-                language="bash",
-            )
-
-        st.divider()
-        st.subheader("💰 Saldo")
-        bal = st.session_state.balance_cache
-        if bal is None:
-            st.code("# saldo: sin consultar", language="bash")
-        elif "error" in bal:
-            st.code(f"[ERROR] {bal['error'][:60]}", language="bash")
-        else:
-            sym = "$" if bal.get("currency") == "USD" else "¥"
-            available = bal.get("is_available", False)
-            st.metric(
-                "Saldo total",
-                f"{sym}{bal.get('total_balance', '?')}",
-                delta="Disponible" if available else "Insuficiente",
-                delta_color="normal" if available else "inverse",
-            )
-            if st.session_state.balance_last_check:
-                st.code(
-                    f"# actualizado: {st.session_state.balance_last_check}",
-                    language="bash",
-                )
-
-        st.divider()
-        st.subheader("💾 Sesión")
+        st.subheader("Sesion")
 
         if st.button(
-            "🔄 Próxima conversación",
+            "Proxima conversacion",
             use_container_width=True,
             type="primary",
             help="Guarda el chat actual en el servidor y empieza uno nuevo.",
@@ -1107,7 +1469,7 @@ def _render_sidebar() -> Dict:
             _save_and_start_new()
 
         if st.button(
-            "🗑️ Descartar sin guardar",
+            "Descartar sin guardar",
             use_container_width=True,
             help="Borra el chat actual sin subirlo al servidor.",
         ):
@@ -1115,7 +1477,7 @@ def _render_sidebar() -> Dict:
             st.rerun()
 
         if st.button(
-            "📂 Recuperar conversación del servidor",
+            "Recuperar conversacion del servidor",
             use_container_width=True,
             help="Lista los respaldos guardados en el servidor remoto.",
         ):
@@ -1127,26 +1489,49 @@ def _render_sidebar() -> Dict:
         if st.session_state.get("show_backups", False):
             _render_backup_browser()
 
-        if st.button("📋 Copiar historial", use_container_width=True):
-            txt = "\n\n".join(
+        if st.button("Copiar historial", use_container_width=True):
+            txt = "\n".join(
                 f"{m['role']}: {_content_to_str(m['content'])}"
                 for m in st.session_state.messages
+                if m.get("role") != "system"
             )
             st.session_state["_copied"] = txt
             st.success("Historial copiado (ver abajo).")
 
         if "_copied" in st.session_state:
-            with st.expander("Historial copiado"):
+            with st.expander("Historial copiado", expanded=False):
                 st.code(st.session_state["_copied"], language="bash")
+            # Limpiamos tras mostrarlo para no arrastrarlo entre reruns.
+            del st.session_state["_copied"]
 
-        with st.expander("🔧 Debug"):
+        with st.expander("Debug", expanded=False):
+            rs = _get_remote_server_cfg()
+            server_dir = rs.get("dir_chat", "(no configurado)")
             st.code(
                 f"run_id:      {st.session_state.run_id}\n"
                 f"log_local:   {st.session_state.log_path}\n"
                 f"debug_dir:   {DEBUG_DIR}\n"
-                f"server_dir:  {st.secrets['remote_server']['dir_chat']}",
+                f"server_dir:  {server_dir}\n"
+                f"temperature: {FIXED_TEMPERATURE}\n"
+                f"max_tokens:  {FIXED_MAX_TOKENS}\n"
+                f"flatten_h:   {st.session_state.get('flatten_headings')}",
                 language="bash",
             )
+
+            if st.button(
+                "Ejecutar self-tests",
+                use_container_width=True,
+                help="Verifica el fix LaTeX.",
+            ):
+                st.session_state["_run_self_tests"] = True
+
+            if st.session_state.get("_run_self_tests", False):
+                ok_latex, msg_latex = _self_test_latex()
+                if ok_latex:
+                    st.success(f"LaTeX: {msg_latex}")
+                else:
+                    st.error(f"LaTeX: {msg_latex}")
+
             if st.button(
                 "Limpiar carpeta debug/",
                 use_container_width=True,
@@ -1160,23 +1545,19 @@ def _render_sidebar() -> Dict:
                 except Exception as e:
                     st.warning(f"No se pudo limpiar: {e}")
 
-        return {
-            "api_key": api_key.strip(),
-            "base_url": base_url.strip(),
-            "model": model,
-            "temperature": float(temperature),
-            "max_tokens": int(max_tokens),
-        }
-
 
 # ============================================================
-# Guardar + empezar nueva conversación
+# Guardar y empezar nueva conversacion
 # ============================================================
 def _save_and_start_new() -> None:
-    if not st.session_state.messages:
-        st.info("La conversación está vacía; no hay nada que guardar.")
+    real_messages = [
+        m for m in st.session_state.messages if m.get("role") != "system"
+    ]
+    if not real_messages:
+        st.info("La conversacion esta vacia; no hay nada que guardar.")
         _reset_conversation()
         st.rerun()
+        return
 
     meta = dict(st.session_state.conversation_meta)
     meta["tokens_total"] = st.session_state.tracker.total
@@ -1185,39 +1566,53 @@ def _save_and_start_new() -> None:
     json_bytes = _export_conversation_json(st.session_state.messages, meta)
     md_bytes = _export_conversation_markdown(st.session_state.messages, meta)
 
-    with st.spinner("Guardando conversación en el servidor…"):
-        ok, msg = upload_backup_to_server(
+    with st.spinner("Guardando conversacion en el servidor..."):
+        ok, msg, ts_efectivo = upload_backup_to_server(
             meta["ts"], json_bytes, md_bytes, title,
         )
 
     if ok:
-        st.success(f"✅ Guardado: {title}")
+        if ts_efectivo != meta["ts"]:
+            st.success(
+                f"Guardado: {title} "
+                f"(timestamp ajustado a {ts_efectivo} por colision)"
+            )
+        else:
+            st.success(f"Guardado: {title}")
         time.sleep(0.8)
         _reset_conversation()
         st.rerun()
+        return
     else:
         st.error(f"No se pudo guardar: {msg}")
 
 
 # ============================================================
-# Navegador de respaldos (lista + cargar + borrar)
+# Navegador de respaldos
 # ============================================================
 def _render_backup_browser() -> None:
     with st.container(border=True):
-        st.markdown("### 📂 Respaldos en el servidor")
-        with st.spinner("Listando respaldos…"):
+        st.markdown("### Respaldos en el servidor")
+
+        col_refresh, _ = st.columns([1, 3])
+        with col_refresh:
+            if st.button("Refrescar lista", use_container_width=True):
+                list_remote_backups(force_refresh=True)
+                st.rerun()
+
+        with st.spinner("Listando respaldos..."):
             backups = list_remote_backups()
 
         if not backups:
             st.code(
-                "# No hay respaldos guardados todavía.",
+                "# No hay respaldos guardados todavia.",
                 language="bash",
             )
             return
 
         opciones = {b["display"]: b for b in backups}
         seleccion = st.selectbox(
-            "Selecciona una conversación:",
+            "Selecciona una conversacion:",
             options=list(opciones.keys()),
             key="select_backup",
         )
@@ -1225,7 +1620,7 @@ def _render_backup_browser() -> None:
         col1, col2 = st.columns(2)
         with col1:
             if st.button(
-                "📥 Cargar",
+                "Cargar",
                 use_container_width=True,
                 type="primary",
             ):
@@ -1242,10 +1637,11 @@ def _render_backup_browser() -> None:
                     st.error(msg)
 
         with col2:
-            if st.button("🗑️ Borrar", use_container_width=True):
+            if st.button("Borrar", use_container_width=True):
                 b = opciones[seleccion]
                 ok, msg = delete_backup_from_server(b["timestamp"])
                 if ok:
+                    list_remote_backups(force_refresh=True)
                     st.success(msg)
                     st.rerun()
                 else:
@@ -1253,47 +1649,52 @@ def _render_backup_browser() -> None:
 
 
 # ============================================================
-# Panel de subida (clip 📎)
+# Panel de adjuntos
 # ============================================================
 def _render_simple_upload_panel() -> Tuple[Dict[str, Dict], Dict[str, Dict]]:
-    st.markdown("### 📎 Adjuntar archivos")
-    st.caption(
-        "Acepta **imágenes** (png, jpg, webp, gif, bmp) y **archivos de "
-        "texto/código** (txt, md, csv, json, py, js, html, css, yaml, "
-        "sql, c, cpp, java, go, rs, rb, php, sh, …). "
-        "Los archivos se adjuntan al **próximo mensaje** que envíes."
-    )
+    st.markdown("### Adjuntar archivos")
 
     uploader_key = f"simple_uploader_{st.session_state['_uploader_key']}"
 
     uploaded_files = st.file_uploader(
-        "Selecciona cualquier archivo (imágenes, texto, código…)",
+        "Selecciona cualquier archivo (imagenes, texto, codigo...)",
         type=(ALLOWED_IMAGE_EXTENSIONS + ALLOWED_UPLOAD_EXTENSIONS),
         accept_multiple_files=True,
         key=uploader_key,
     )
 
     if not uploaded_files:
-        st.code(
-            "# Sin archivos seleccionados.\n"
-            "# Arrastra archivos aquí o usa «Browse files».",
-            language="bash",
-        )
         return {}, {}
 
     if len(uploaded_files) > MAX_UPLOAD_FILES + MAX_IMAGE_FILES:
         st.code(
             f"[ERROR] Demasiados archivos: {len(uploaded_files)}. "
-            f"Máximo combinado: {MAX_UPLOAD_FILES + MAX_IMAGE_FILES}.",
+            f"Maximo combinado: {MAX_UPLOAD_FILES + MAX_IMAGE_FILES}.",
             language="bash",
         )
         return {}, {}
 
-    with st.spinner("Procesando archivos…"):
+    # Dedupe: no re-procesar archivos ya vistos en esta sesion de uploader.
+    seen = st.session_state.get("_seen_uploads", set())
+    new_files = []
+    for uf in uploaded_files:
+        sig = (getattr(uf, "name", "?"), getattr(uf, "size", 0))
+        if sig in seen:
+            continue
+        new_files.append(uf)
+
+    if not new_files:
+        return {}, {}
+
+    with st.spinner("Procesando archivos..."):
         texts, images, skipped = _read_uploaded_any(
-            uploaded_files,
+            new_files,
             logger=st.session_state.logger,
         )
+
+    for uf in new_files:
+        seen.add((getattr(uf, "name", "?"), getattr(uf, "size", 0)))
+    st.session_state["_seen_uploads"] = seen
 
     msgs = []
     if texts:
@@ -1302,38 +1703,39 @@ def _render_simple_upload_panel() -> Tuple[Dict[str, Dict], Dict[str, Dict]]:
         msgs.append(f"{len(images)} imagen(es)")
     if msgs:
         st.success(
-            "✅ Listos: " + " y ".join(msgs)
-            + ". Se enviarán con tu próximo mensaje."
+            "Listos: " + " y ".join(msgs)
+            + ". Se enviaran con tu proximo mensaje."
         )
     if skipped:
         st.code(
-            "[WARN] Omitidos:\n" + "\n".join(f"  - {s}" for s in skipped),
+            "[WARN] Omitidos:\n"
+            + "\n".join(f"  - {s}" for s in skipped),
             language="bash",
         )
     if not texts and not images and not skipped:
         st.code(
-            "[WARN] No se pudo procesar ningún archivo.",
+            "[WARN] No se pudo procesar ningun archivo.",
             language="bash",
         )
 
     if texts or images:
-        with st.expander("👁️ Previsualizar adjuntos", expanded=False):
+        with st.expander("Previsualizar adjuntos", expanded=False):
             if texts:
-                st.markdown("**Textos / código:**")
+                st.markdown("**Textos / codigo:**")
                 for name, meta in texts.items():
                     st.code(
-                        f"{name} — {meta.get('size', 0):,} bytes · "
-                        f"{meta.get('lines', 0):,} líneas · "
+                        f"{name} - {meta.get('size', 0):,} bytes - "
+                        f"{meta.get('lines', 0):,} lineas - "
                         f"encoding: {meta.get('encoding', '?')}",
                         language="bash",
                     )
             if images:
-                st.markdown("**Imágenes:**")
+                st.markdown("**Imagenes:**")
                 cols = st.columns(min(len(images), 4))
                 for i, (name, meta) in enumerate(images.items()):
                     with cols[i % len(cols)]:
                         st.image(
-                            meta["bytes"],
+                            meta.get("bytes") or b"",
                             caption=name,
                             use_container_width=True,
                         )
@@ -1341,14 +1743,11 @@ def _render_simple_upload_panel() -> Tuple[Dict[str, Dict], Dict[str, Dict]]:
     return texts, images
 
 
-# ============================================================
-# Chips de adjuntos pendientes
-# ============================================================
 def _render_pending_chips(pending_t: Dict, pending_i: Dict) -> None:
     if not pending_t and not pending_i:
         return
 
-    st.markdown("**📌 Adjuntos listos para el próximo mensaje:**")
+    st.markdown("**Adjuntos listos para el proximo mensaje:**")
     chip_cols = st.columns(
         min(max(len(pending_t) + len(pending_i), 1), 4)
     )
@@ -1357,41 +1756,213 @@ def _render_pending_chips(pending_t: Dict, pending_i: Dict) -> None:
         with chip_cols[idx % len(chip_cols)]:
             with st.container(border=True):
                 st.code(
-                    f"📄 {name}\n"
-                    f"{meta.get('size', 0):,} B · "
-                    f"{meta.get('lines', 0):,} líneas",
+                    f"{name}\n"
+                    f"{meta.get('size', 0):,} B - "
+                    f"{meta.get('lines', 0):,} lineas",
                     language="bash",
                 )
         idx += 1
     for name, meta in pending_i.items():
         with chip_cols[idx % len(chip_cols)]:
             with st.container(border=True):
-                st.image(
-                    meta["bytes"],
-                    caption=name,
-                    use_container_width=True,
-                )
+                img_bytes = meta.get("bytes") or b""
+                if img_bytes:
+                    st.image(
+                        img_bytes,
+                        caption=name,
+                        use_container_width=True,
+                    )
+                else:
+                    st.code(f"{name}\n(metadatos)", language="bash")
         idx += 1
 
 
+def _compose_user_text_with_attachments(
+    prompt: str,
+    texts_to_send: Dict[str, Dict],
+) -> str:
+    if not texts_to_send:
+        return prompt
+    bloques = [_wrap_attachment_text(name, meta)
+               for name, meta in texts_to_send.items()]
+    joined = "\n\n".join(bloques)
+    if not prompt:
+        return joined
+    return prompt + "\n\n" + joined
+
+
 # ============================================================
-# Pestaña de Chat
+# Chat: manejo de input y streaming
+# ============================================================
+def _handle_user_input(
+    prompt: str,
+    model: str,
+    api_key: str,
+    base_url: str,
+    temperature: float,
+    max_tokens: int,
+) -> None:
+    texts_to_send = dict(st.session_state["_ephemeral_texts"])
+    imgs_to_send = dict(st.session_state["_ephemeral_images"])
+    st.session_state["_ephemeral_texts"] = {}
+    st.session_state["_ephemeral_images"] = {}
+    st.session_state["_uploader_key"] += 1
+    st.session_state["_seen_uploads"] = set()
+    st.session_state.show_uploader = False
+
+    user_text = _compose_user_text_with_attachments(prompt, texts_to_send)
+
+    if imgs_to_send and model in MULTIMODAL_MODELS:
+        user_content: Union[str, List] = _build_multimodal_content(
+            user_text, imgs_to_send,
+        )
+    elif imgs_to_send:
+        user_content = (
+            user_text
+            + f"\n\n[Se adjuntaron {len(imgs_to_send)} imagen(es) "
+            + f"pero el modelo {model} no las soporta. "
+            + f"Nombres: {', '.join(imgs_to_send.keys())}]"
+        )
+    else:
+        user_content = user_text
+
+    # Comprobamos budget ANTES de anadir el mensaje del usuario.
+    tracker: _TokenTracker = st.session_state.tracker
+    if tracker.over_budget():
+        st.code(
+            "[ERROR] Presupuesto de tokens excedido. "
+            "Reinicia la conversacion para seguir.",
+            language="bash",
+        )
+        return
+
+    user_msg = {"role": "user", "content": user_content}
+    st.session_state.messages.append(user_msg)
+
+    # Render consistente con el historico: mostramos el mismo texto
+    # que se guarda (con bloques de adjuntos si los hay).
+    _render_message("user", user_content)
+
+    _log(
+        st.session_state.logger,
+        event="user_message",
+        length=len(prompt),
+        n_texts=len(texts_to_send),
+        n_images=len(imgs_to_send),
+    )
+
+    context = _trim_history(st.session_state.messages)
+    client = _make_client(api_key, base_url)
+
+    full_response = _stream_assistant_response(
+        client=client,
+        context=context,
+        model=model,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        tracker=tracker,
+    )
+
+    if full_response is None:
+        # Error: quitamos el mensaje del usuario para no dejarlo huerfano.
+        if (
+            st.session_state.messages
+            and st.session_state.messages[-1] is user_msg
+        ):
+            st.session_state.messages.pop()
+        return
+
+    assistant_msg = {"role": "assistant", "content": full_response}
+    st.session_state.messages.append(assistant_msg)
+    st.session_state.conversation_meta["tokens_total"] = tracker.total
+    st.session_state.conversation_meta["model"] = model
+
+    _log(
+        st.session_state.logger,
+        event="assistant_message",
+        length=len(full_response),
+        tokens_total=tracker.total,
+        model=model,
+    )
+
+    st.session_state["_turn_counter"] = (
+        int(st.session_state.get("_turn_counter", 0)) + 1
+    )
+
+    # Rotacion de debug cada N turnos, no en cada turno.
+    if st.session_state["_turn_counter"] % ROTATE_DEBUG_EVERY_N_TURNS == 0:
+        _rotate_debug_dir()
+
+    st.rerun()
+
+
+def _stream_assistant_response(
+    client: OpenAI,
+    context: Sequence[Dict],
+    model: str,
+    max_tokens: int,
+    temperature: float,
+    tracker: _TokenTracker,
+) -> Optional[str]:
+    """
+    Devuelve el texto completo o None si hubo error (en cuyo caso ya
+    se ha mostrado el error al usuario).
+    """
+    flatten = bool(st.session_state.get("flatten_headings", True))
+    with st.chat_message("assistant", avatar="🤖"):
+        placeholder = st.empty()
+        full_response = ""
+        try:
+            for delta in _call_streaming(
+                client=client,
+                messages=context,
+                model=model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                tracker=tracker,
+            ):
+                full_response += delta
+                placeholder.markdown(
+                    _prepare_for_render(
+                        full_response + "|", flatten_headings=flatten,
+                    ),
+                    unsafe_allow_html=False,
+                )
+            placeholder.markdown(
+                _prepare_for_render(
+                    full_response, flatten_headings=flatten,
+                ),
+                unsafe_allow_html=False,
+            )
+        except Exception as e:
+            st.code(
+                f"[ERROR] Error al llamar a la API: {e}",
+                language="bash",
+            )
+            _log(
+                st.session_state.logger,
+                event="api_error",
+                error=str(e)[:300],
+            )
+            return None
+
+        _show_response_text(full_response)
+    return full_response
+
+
+# ============================================================
+# Tab principal del chat
 # ============================================================
 def _render_chat_tab(cfg: Dict) -> None:
-    """
-    Pestaña principal de chat con streaming en vivo.
-    - Streaming en Markdown normal, sin HTML.
-    - Al terminar, se aplica _prepare_for_render (LaTeX + fences).
-    """
     api_key = cfg["api_key"]
     base_url = cfg["base_url"]
-    model = cfg["model"]
-    temperature = cfg["temperature"]
-    max_tokens = cfg["max_tokens"]
+    temperature = FIXED_TEMPERATURE
+    max_tokens = FIXED_MAX_TOKENS
+    model = DEFAULT_MODEL
 
     if not api_key or not api_key.startswith("sk-"):
         st.code(
-            "[WARN] Configura una API Key válida de DeepSeek (sk-...) "
+            "[WARN] Configura una API Key valida de DeepSeek (sk-...) "
             "en la barra lateral.",
             language="bash",
         )
@@ -1403,43 +1974,22 @@ def _render_chat_tab(cfg: Dict) -> None:
         )
         return
 
-    bal = st.session_state.balance_cache
-    if bal and "error" not in bal and not bal.get("is_available", True):
-        st.code(
-            "[ERROR] Tu cuenta no tiene saldo disponible "
-            "(is_available=false).\n"
-            "        Recarga en https://platform.deepseek.com/top_up",
-            language="bash",
-        )
-
-    # ------------------------------------------------------------
-    # Historial
-    # ------------------------------------------------------------
     for msg in st.session_state.messages:
+        if msg.get("role") == "system":
+            continue
         _render_message(msg.get("role", "user"), msg.get("content", ""))
-
-    # ------------------------------------------------------------
-    # Estado local de adjuntos
-    # ------------------------------------------------------------
-    if "_ephemeral_texts" not in st.session_state:
-        st.session_state["_ephemeral_texts"] = {}
-    if "_ephemeral_images" not in st.session_state:
-        st.session_state["_ephemeral_images"] = {}
 
     pending_t = st.session_state["_ephemeral_texts"]
     pending_i = st.session_state["_ephemeral_images"]
 
-    # ------------------------------------------------------------
-    # Barra superior del composer
-    # ------------------------------------------------------------
     clip_col, info_col = st.columns([1, 9])
     with clip_col:
         if st.button(
             "📎",
             key="clip_toggle",
             help=(
-                "Adjuntar archivos (imágenes, texto o código) "
-                "al próximo mensaje"
+                "Adjuntar archivos (imagenes, texto o codigo) "
+                "al proximo mensaje"
             ),
             use_container_width=True,
             type=(
@@ -1460,11 +2010,11 @@ def _render_chat_tab(cfg: Dict) -> None:
             if pending_i:
                 partes.append(f"{len(pending_i)} imagen(es)")
             info_lines.append(
-                "# adjuntos para el próximo mensaje: " + " + ".join(partes)
+                "# adjuntos para el proximo mensaje: " + " + ".join(partes)
             )
         else:
             info_lines.append(
-                "# sin adjuntos — pulsa 📎 para añadir archivos"
+                "# sin adjuntos - pulsa el clip para anadir archivos"
             )
         st.code("\n".join(info_lines), language="bash")
 
@@ -1477,329 +2027,26 @@ def _render_chat_tab(cfg: Dict) -> None:
                 st.session_state["_ephemeral_texts"] = pending_t
                 st.session_state["_ephemeral_images"] = pending_i
 
-        col_a, col_b = st.columns(2)
-        with col_a:
-            if st.button(
-                "✖️ Limpiar adjuntos",
-                key="clear_ephemeral",
-                use_container_width=True,
-                disabled=not (pending_t or pending_i),
-            ):
-                st.session_state["_ephemeral_texts"] = {}
-                st.session_state["_ephemeral_images"] = {}
-                st.session_state["_uploader_key"] += 1
-                st.rerun()
-        with col_b:
-            if st.button(
-                "✔️ Cerrar panel",
-                key="close_uploader",
-                use_container_width=True,
-            ):
-                st.session_state.show_uploader = False
-                st.rerun()
-
     if pending_t or pending_i:
         _render_pending_chips(pending_t, pending_i)
 
-    # ------------------------------------------------------------
-    # Chat input
-    # ------------------------------------------------------------
-    if prompt := st.chat_input("Escribe tu mensaje…"):
-        texts_to_send = dict(st.session_state["_ephemeral_texts"])
-        imgs_to_send = dict(st.session_state["_ephemeral_images"])
-        st.session_state["_ephemeral_texts"] = {}
-        st.session_state["_ephemeral_images"] = {}
-        st.session_state["_uploader_key"] += 1
-        st.session_state.show_uploader = False
-
-        user_text = prompt
-        if texts_to_send:
-            bloques = []
-            for name, meta in texts_to_send.items():
-                bloques.append(
-                    f"[Archivo adjunto: {name}]\n"
-                    f"{meta.get('content', '')}\n"
-                    f"[Fin de {name}]"
-                )
-            user_text = user_text + "\n\n" + "\n\n".join(bloques)
-
-        if imgs_to_send and model in MULTIMODAL_MODELS:
-            user_content: Union[str, List] = _build_multimodal_content(
-                user_text, imgs_to_send,
-            )
-        elif imgs_to_send:
-            user_content = (
-                user_text
-                + f"\n\n[Se adjuntaron {len(imgs_to_send)} imagen(es) "
-                f"pero el modelo «{model}» no las soporta. "
-                f"Nombres: {', '.join(imgs_to_send.keys())}]"
-            )
-        else:
-            user_content = user_text
-
-        user_msg = {"role": "user", "content": user_content}
-        st.session_state.messages.append(user_msg)
-
-        if texts_to_send or imgs_to_send:
-            aviso = []
-            if texts_to_send:
-                aviso.append(f"{len(texts_to_send)} texto(s)")
-            if imgs_to_send:
-                aviso.append(f"{len(imgs_to_send)} imagen(es)")
-            _render_message(
-                "user",
-                prompt + f"\n\n[Adjuntos: {', '.join(aviso)}]",
-            )
-        else:
-            _render_message("user", prompt)
-
-        _log(
-            st.session_state.logger,
-            event="user_message",
-            length=len(prompt),
-            preview=prompt[:120],
-            n_texts=len(texts_to_send),
-            n_images=len(imgs_to_send),
-        )
-
-        tracker: _TokenTracker = st.session_state.tracker
-        if tracker.over_budget():
-            st.code(
-                "[ERROR] Presupuesto de tokens excedido. "
-                "Reinicia la conversación para seguir.",
-                language="bash",
-            )
-            return
-
-        context = _trim_history(st.session_state.messages)
-        client = _make_client(api_key, base_url)
-
-        with st.chat_message("assistant", avatar="🤖"):
-            placeholder = st.empty()
-            full_response = ""
-            try:
-                for delta in _call_streaming(
-                    client=client,
-                    messages=context,
-                    model=model,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    tracker=tracker,
-                ):
-                    full_response += delta
-                    # Streaming: Markdown plano sin HTML.
-                    # Evita inyectar HTML parcial mientras llega el texto.
-                    placeholder.markdown(full_response + "▌")
-                # Render final con pipeline completo (LaTeX + fences + saneo).
-                placeholder.markdown(_prepare_for_render(full_response))
-            except Exception as e:
-                st.code(
-                    f"[ERROR] Error al llamar a la API: {e}",
-                    language="bash",
-                )
-                _log(
-                    st.session_state.logger,
-                    event="api_error",
-                    error=str(e),
-                )
-                if (
-                    st.session_state.messages
-                    and st.session_state.messages[-1] is user_msg
-                ):
-                    st.session_state.messages.pop()
-                return
-
-            _render_plain_copyable(full_response, "📋 Copiar respuesta")
-
-        assistant_msg = {"role": "assistant", "content": full_response}
-        st.session_state.messages.append(assistant_msg)
-        st.session_state.conversation_meta["tokens_total"] = tracker.total
-        st.session_state.conversation_meta["model"] = model
-
-        _log(
-            st.session_state.logger,
-            event="assistant_message",
-            length=len(full_response),
-            tokens_total=tracker.total,
+    if prompt := st.chat_input("Escribe tu mensaje..."):
+        _handle_user_input(
+            prompt=prompt,
             model=model,
+            api_key=api_key,
+            base_url=base_url,
+            temperature=temperature,
+            max_tokens=max_tokens,
         )
 
-        _rotate_debug_dir()
-
-        st.session_state["_scroll_to_bottom"] = True
-        st.session_state["_turn_counter"] = (
-            st.session_state.get("_turn_counter", 0) + 1
-        )
-        st.rerun()
-
-    # ------------------------------------------------------------
-    # Ancla de scroll
-    # ------------------------------------------------------------
-    if st.session_state.get("_scroll_to_bottom"):
-        _inject_scroll_anchor()
-        st.session_state["_scroll_to_bottom"] = False
-    else:
-        _inject_scroll_anchor()
+    _inject_autoscroll()
 
     st.divider()
 
-# ============================================================
-# Ancla de scroll al final del chat
-# ============================================================
-def _inject_scroll_anchor() -> None:
-    anchor_id = f"__chat_bottom_{st.session_state.get('_turn_counter', 0)}__"
-    st.markdown(
-        f'<div id="{anchor_id}" style="height:1px;"></div>',
-        unsafe_allow_html=True,
-    )
-    st.markdown(
-        f"""
-        <script>
-        (function() {{
-            const el = document.getElementById("{anchor_id}");
-            if (el && el.scrollIntoView) {{
-                el.scrollIntoView({{behavior: "smooth", block: "end"}});
-            }}
-            const main = document.querySelector('section.main');
-            if (main) {{
-                main.scrollTo({{top: main.scrollHeight, behavior: "smooth"}});
-            }}
-        }})();
-        </script>
-        """,
-        unsafe_allow_html=True,
-    )
-
 
 # ============================================================
-# Pestaña de Saldo
-# ============================================================
-def _render_balance_tab(cfg: Dict) -> None:
-    """Pestaña de consulta de saldo de la cuenta DeepSeek."""
-    api_key = cfg["api_key"]
-    base_url = cfg["base_url"]
-
-    st.header("💰 Saldo de la cuenta DeepSeek")
-    st.caption(
-        "Consulta el saldo vía `GET /user/balance`. El saldo se descuenta "
-        "según los tokens que consumes en cada llamada a la API. Si "
-        "`is_available` es `false`, la API rechazará nuevas peticiones con "
-        "error 402."
-    )
-
-    if not api_key or not api_key.startswith("sk-"):
-        st.code(
-            "[WARN] Configura una API Key válida de DeepSeek (sk-...) "
-            "en la barra lateral antes de consultar el saldo.",
-            language="bash",
-        )
-        return
-
-    col_btn, col_auto = st.columns([1, 2])
-    with col_btn:
-        consultar = st.button(
-            "🔄 Consultar saldo",
-            type="primary",
-            use_container_width=True,
-        )
-    with col_auto:
-        auto_refresh = st.checkbox(
-            "Actualizar automáticamente cada 60 s",
-            value=False,
-            help="Útil si estás chateando y quieres ver el saldo en vivo.",
-        )
-
-    if consultar or auto_refresh:
-        with st.spinner("Consultando saldo…"):
-            bal = get_deepseek_balance(api_key, base_url)
-            st.session_state.balance_cache = bal
-            st.session_state.balance_last_check = (
-                datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            )
-            _log(
-                st.session_state.logger,
-                event="balance_check",
-                result=bal,
-            )
-
-    bal = st.session_state.balance_cache
-
-    if bal is None:
-        st.code(
-            "# Aún no has consultado el saldo.\n"
-            "# Pulsa «🔄 Consultar saldo» para obtenerlo.",
-            language="bash",
-        )
-        return
-
-    if "error" in bal:
-        st.code(
-            f"[ERROR] No se pudo consultar el saldo: {bal['error']}\n"
-            "# Posibles causas: API Key inválida, sin conexión a internet,\n"
-            "# o el endpoint /user/balance no está disponible en tu\n"
-            "# región/plan.",
-            language="bash",
-        )
-        return
-
-    currency = bal.get("currency", "?")
-    sym = "$" if currency == "USD" else ("¥" if currency == "CNY" else "")
-    available = bal.get("is_available", False)
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric(
-            "Saldo total",
-            f"{sym}{bal.get('total_balance', '?')}",
-            delta="Disponible" if available else "Insuficiente",
-            delta_color="normal" if available else "inverse",
-        )
-    with col2:
-        st.metric(
-            "Saldo recargado",
-            f"{sym}{bal.get('topped_up_balance', '?')}",
-            help="Dinero real que has abonado a la cuenta.",
-        )
-    with col3:
-        st.metric(
-            "Crédito gratuito",
-            f"{sym}{bal.get('granted_balance', '?')}",
-            help="Crédito promocional o gratuito no expirado (si lo hay).",
-        )
-
-    st.divider()
-    if available:
-        st.code(
-            "[OK] Saldo disponible. Puedes seguir llamando a la API.",
-            language="bash",
-        )
-    else:
-        st.code(
-            "[ERROR] Saldo insuficiente (is_available=false).\n"
-            "        La API rechazará nuevas peticiones con error 402\n"
-            "        hasta que recargues.",
-            language="bash",
-        )
-
-    st.code(
-        "# Recargar saldo:\n"
-        "#   https://platform.deepseek.com/top_up\n"
-        "# Acepta Alipay, WeChat Pay, PayPal y tarjeta bancaria.\n"
-        "# El saldo de recarga no expira.",
-        language="bash",
-    )
-
-    st.divider()
-    st.subheader("📈 Consumo de esta sesión")
-    tracker: _TokenTracker = st.session_state.tracker
-    col_s1, col_s2, col_s3 = st.columns(3)
-    col_s1.metric("Tokens prompt", f"{tracker.prompt:,}")
-    col_s2.metric("Tokens completion", f"{tracker.completion:,}")
-    col_s3.metric("Tokens totales", f"{tracker.total:,}")
-
-
-# ============================================================
-# main() con pestañas
+# main
 # ============================================================
 def main() -> None:
     st.set_page_config(
@@ -1810,24 +2057,12 @@ def main() -> None:
     )
 
     _init_session_state()
-
-    # Inyecta el CSS global una sola vez por sesión.
     _inject_global_css()
-
-    cfg = _render_sidebar()
-
-    tab_chat, tab_balance = st.tabs(["💬 Chat", "💰 Saldo"])
-
-    with tab_chat:
-        _render_chat_tab(cfg)
-
-    with tab_balance:
-        _render_balance_tab(cfg)
+    cfg = _render_sidebar_controls()
+    _render_sidebar_actions()
+    _render_chat_tab(cfg)
 
 
-# ============================================================
-# Entry point
-# ============================================================
 if __name__ == "__main__":
     main()
-    
+
