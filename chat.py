@@ -1,7 +1,7 @@
 import streamlit as st
 from openai import OpenAI
 
-st.set_page_config(page_title="DeepSeek", page_icon="🐋", layout="centered")
+st.set_page_config(page_title="DeepSeek",  layout="centered")
 
 # ---------- Estado ----------
 if "messages" not in st.session_state:
@@ -47,7 +47,7 @@ with st.sidebar:
     st.caption("Obtén tu key en platform.deepseek.com")
 
 # ---------- Cabecera ----------
-st.title("🐋 DeepSeek Code Reviewer")
+st.title("  Code Reviewer")
 
 # ---------- Historial ----------
 # Solo mostramos el contenido que NO sea oculto
