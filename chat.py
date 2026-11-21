@@ -86,7 +86,7 @@ ALLOWED_IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "webp", "gif", "bmp", "pdf"]
 
 # Modelos que aceptan contenido multimodal (image_url).
 # Si esta vacio, las imagenes se envian solo como metadatos/thumbnail.
-MULTIMODAL_MODELS: set = set()
+MULTIMODAL_MODELS: set = {"deepseek-flash"}  # Era set() vacío
 
 ALLOWED_IMAGE_MIMES = {
     "image/png", "image/jpeg", "image/jpg", "image/webp",
