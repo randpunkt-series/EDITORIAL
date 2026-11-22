@@ -47,7 +47,7 @@ with st.sidebar:
     st.caption("Obtén tu key en platform.deepseek.com")
 
 # ---------- Cabecera ----------
-st.title("🧠 Code Reviewer")
+st.title("🏡 Code Reviewer")
 
 # ---------- Historial ----------
 # Solo mostramos el contenido que NO sea oculto
