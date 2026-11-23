@@ -38,7 +38,7 @@ with st.sidebar:
     st.divider()
     
     # Cargador de archivos
-    uploaded_file = st.file_uploader("Sube tu archivo de código", type=["py", "jpg", "txt", "tex", "pdf", "png", "txt", "js", "html", "css"])
+    uploaded_file = st.file_uploader("Sube tu archivo de código", type=["py", "doc", "docx", "jpg", "txt", "tex", "pdf", "png", "txt", "js", "html", "css"])
 
     if st.button("Limpiar conversación", use_container_width=True):
         st.session_state.messages = []
