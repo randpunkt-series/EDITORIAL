@@ -134,8 +134,8 @@ with st.sidebar:
         api_key = st.session_state.get("api_key", "")
         st.caption("No se encontró DEEPSEEK_API_KEY en secrets.toml")
 
-    #model = st.selectbox("Modelo", ["deepseek-chat", "deepseek-reasoner"])
-    model = st.selectbox("Modelo", ["deepseek-v4-flash", "deepseek-reasoner"])
+    model = st.selectbox("Modelo", ["deepseek-chat", "deepseek-reasoner"])
+    #model = st.selectbox("Modelo", ["deepseek-v4-flash", "deepseek-reasoner"])
     temperature = st.slider(
         "Temperatura",
         0.0, 2.0, 1.0, 0.1,
