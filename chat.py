@@ -3,38 +3,48 @@ from openai import OpenAI, APIError, AuthenticationError, RateLimitError
 import io
 
 # ---------- Configuración de página ----------
-st.set_page_config(page_title="Code Reviewer", page_icon="🏡", layout="centered")
+st.set_page_config(page_title="Code Reviewer (Económico)", page_icon="🏡", layout="centered")
 
-# Límite de caracteres del archivo para no reventar el contexto (~50k tokens)
+# Límite de caracteres del archivo para no reventar el contexto.
 MAX_CHARS = 200_000
 
-# Límite de tokens de salida por respuesta (8192 en DeepSeek).
-MAX_OUTPUT_TOKENS = 8192
+# Límite de tokens de salida por respuesta (conciso y económico).
+MAX_OUTPUT_TOKENS = 2_048
 
-# Número máximo de continuaciones automáticas si la respuesta se corta.
-# Reducido a 0: la auto-continuación multiplica el consumo de tokens.
+# Sin auto-continuación: cada respuesta es una sola llamada.
 MAX_CONTINUATIONS = 0
 
-# Número de rondas (user+assistant) que se conservan en el historial enviado a la API.
-MAX_HISTORY_ROUNDS = 4
+# Número de rondas (user+assistant) que se conservan en el historial.
+MAX_HISTORY_ROUNDS = 2
+
+# Límite máximo de tokens del prompt (archivo + historial). Muy agresivo.
+MAX_PROMPT_TOKENS = 8_000
+
+# Umbral de tokens del archivo para generar resumen agresivo.
+FILE_SUMMARY_THRESHOLD = 4_000
+
+# Tokens máximos para el resumen del archivo.
+SUMMARY_MAX_TOKENS = 400
 
 # ---------- Estado ----------
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "uploader_key" not in st.session_state:
     st.session_state.uploader_key = 0
-# Guarda el contenido del archivo ya enviado para no reenviarlo en cada ronda.
 if "file_context" not in st.session_state:
     st.session_state.file_context = None
 if "file_context_name" not in st.session_state:
     st.session_state.file_context_name = None
-# Última info de uso de tokens reportada por la API.
+if "file_sent" not in st.session_state:
+    st.session_state.file_sent = False
 if "last_usage" not in st.session_state:
     st.session_state.last_usage = None
+# Aviso de recorte de historial
+if "history_truncated" not in st.session_state:
+    st.session_state.history_truncated = False
 
 # ---------- Utilidades de extracción de texto ----------
 def extract_pdf_text(raw: bytes) -> str:
-    """Extrae texto de un PDF usando pypdf."""
     try:
         from pypdf import PdfReader
     except ImportError:
@@ -53,7 +63,6 @@ def extract_pdf_text(raw: bytes) -> str:
 
 
 def extract_docx_text(raw: bytes) -> str:
-    """Extrae texto de un .docx usando python-docx."""
     try:
         from docx import Document
     except ImportError:
@@ -73,7 +82,6 @@ def extract_docx_text(raw: bytes) -> str:
 
 
 def extract_png_text(raw: bytes) -> str:
-    """Extrae texto de un PNG usando pytesseract + Pillow (OCR)."""
     try:
         from PIL import Image
     except ImportError:
@@ -102,7 +110,6 @@ def extract_png_text(raw: bytes) -> str:
 
 
 def read_uploaded_file(uploaded_file):
-    """Devuelve el texto extraído del archivo subido según su extensión."""
     raw = uploaded_file.getvalue()
     name = uploaded_file.name.lower()
 
@@ -128,37 +135,69 @@ def read_uploaded_file(uploaded_file):
             st.stop()
 
 
-def build_api_messages():
-    """
-    Construye la lista de mensajes para la API.
+def estimate_tokens(text: str) -> int:
+    """Estimación aproximada: ~4 caracteres = 1 token."""
+    return len(text) // 4
 
-    Estrategia anti-consumo:
-      - Solo se envían las últimas MAX_HISTORY_ROUNDS rondas (user+assistant).
-      - El contenido del archivo se envía como mensaje de sistema UNA SOLA VEZ,
-        al principio, y no se vuelve a repetir en cada ronda.
-      - Los mensajes ocultos (hidden) del historial NO se reenvían.
+
+def summarize_file(client, text: str, model: str) -> str:
+    """Genera un resumen agresivo del archivo para ahorrar tokens."""
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Resume el siguiente archivo en menos de 150 palabras. "
+                        "Incluye: propósito, estructura principal, funciones clave, "
+                        "y problemas potenciales detectados."
+                    ),
+                },
+                {"role": "user", "content": text[:MAX_CHARS]},
+            ],
+            max_tokens=SUMMARY_MAX_TOKENS,
+        )
+        content = resp.choices[0].message.content or ""
+        finish = resp.choices[0].finish_reason
+        if finish == "length":
+            st.warning("⚠️ El resumen del archivo se cortó por límite de tokens.")
+        return content
+    except Exception as e:
+        st.warning(f"No se pudo generar el resumen: {e}. Se usará texto truncado.")
+        return text[:MAX_CHARS]
+
+
+def build_api_messages(include_file: bool = False):
     """
-    # 1) Filtrar mensajes ocultos del historial visible
+    Construye la lista de mensajes para la API con recorte agresivo.
+    """
     visible = [m for m in st.session_state.messages if not m.get("hidden", False)]
 
-    # 2) Recortar a las últimas N rondas.
-    #    Una "ronda" = un mensaje user + los assistant que le sigan.
-    #    Para simplificar, recortamos por pares user/assistant desde el final.
-    trimmed = visible[-MAX_HISTORY_ROUNDS * 2:] if MAX_HISTORY_ROUNDS > 0 else visible
+    if MAX_HISTORY_ROUNDS > 0:
+        visible = visible[-MAX_HISTORY_ROUNDS * 2:]
+
+    trimmed = []
+    total_tokens = 0
+    for m in reversed(visible):
+        t = estimate_tokens(m["content"])
+        if total_tokens + t > MAX_PROMPT_TOKENS:
+            st.session_state.history_truncated = True
+            break
+        trimmed.insert(0, m)
+        total_tokens += t
 
     api_messages = []
 
-    # 3) Inyectar el contexto del archivo como mensaje de sistema (una sola vez).
-    if st.session_state.file_context:
+    if include_file and st.session_state.file_context:
         api_messages.append({
             "role": "system",
             "content": (
-                f"El usuario ha adjuntado el archivo `{st.session_state.file_context_name}`. "
-                f"Su contenido es el siguiente:\n\n```\n{st.session_state.file_context}\n```"
+                f"Archivo `{st.session_state.file_context_name}` (resumen):\n\n"
+                f"```\n{st.session_state.file_context}\n```"
             ),
         })
 
-    # 4) Añadir el historial recortado (sin los hidden).
     for m in trimmed:
         api_messages.append({"role": m["role"], "content": m["content"]})
 
@@ -207,13 +246,24 @@ with st.sidebar:
         st.session_state.messages = []
         st.session_state.file_context = None
         st.session_state.file_context_name = None
+        st.session_state.file_sent = False
         st.session_state.last_usage = None
+        st.session_state.history_truncated = False
         st.session_state.uploader_key += 1
         st.rerun()
 
     st.divider()
 
-    # Mostrar uso de tokens de la última llamada (para diagnosticar caché)
+    # Modo económico: información visible
+    st.info(
+        "💰 **Modo económico activo**\n\n"
+        f"- Prompt máx: {MAX_PROMPT_TOKENS:,} tokens\n"
+        f"- Salida máx: {MAX_OUTPUT_TOKENS:,} tokens\n"
+        f"- Historial: últimas {MAX_HISTORY_ROUNDS} rondas\n"
+        f"- Sin auto-continuación"
+    )
+
+    # Mostrar uso de tokens
     if st.session_state.last_usage:
         u = st.session_state.last_usage
         st.subheader("Uso de tokens (última llamada)")
@@ -229,15 +279,20 @@ with st.sidebar:
             if total_cache > 0:
                 ratio = (hit or 0) / total_cache * 100
                 st.progress(min(ratio / 100.0, 1.0), text=f"Acierto de caché: {ratio:.1f}%")
-        st.caption(
-            "Si el acierto de caché es bajo, revisa el orden del historial "
-            "y el contenido del archivo."
-        )
 
     st.caption("Obtén tu key en platform.deepseek.com")
 
 # ---------- Cabecera ----------
 st.title("🏡 Code Reviewer")
+st.caption("💰 Modo económico: respuestas concisas, contexto mínimo, máximo ahorro de tokens.")
+
+# Aviso si el historial se recortó
+if st.session_state.history_truncated:
+    st.warning(
+        "⚠️ El historial se ha recortado por límite de tokens. "
+        "Las preguntas muy antiguas ya no se envían al modelo. "
+        "Usa 'Limpiar conversación' para empezar de cero."
+    )
 
 # ---------- Historial visible ----------
 for msg in st.session_state.messages:
@@ -264,11 +319,10 @@ if prompt := st.chat_input("Escribe tu pregunta sobre el código..."):
         if uploaded_file is not None:
             st.caption(f"📎 Archivo adjunto: {uploaded_file.name}")
 
-    # 2. Si hay archivo, extraerlo y guardarlo en el contexto persistente
-    #    (SOLO UNA VEZ). No se añade como mensaje hidden al historial.
+    # 2. Si hay archivo NUEVO, extraerlo, resumirlo (agresivo) y guardarlo
     if uploaded_file is not None:
-        # Evitar re-extraer si ya está cargado el mismo archivo
         if st.session_state.file_context_name != uploaded_file.name:
+            client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
             file_content = read_uploaded_file(uploaded_file)
 
             if len(file_content) > MAX_CHARS:
@@ -278,13 +332,20 @@ if prompt := st.chat_input("Escribe tu pregunta sobre el código..."):
                 )
                 file_content = file_content[:MAX_CHARS]
 
+            # Resumen agresivo si supera FILE_SUMMARY_THRESHOLD tokens
+            if estimate_tokens(file_content) > FILE_SUMMARY_THRESHOLD:
+                with st.spinner("Generando resumen del archivo para ahorrar tokens..."):
+                    file_content = summarize_file(client, file_content, model)
+                    st.info("📝 Se ha generado un resumen del archivo para reducir el consumo.")
+
             st.session_state.file_context = file_content
             st.session_state.file_context_name = uploaded_file.name
+            st.session_state.file_sent = False
 
-    # 3. Payload para la API (historial recortado + contexto de archivo único)
-    messages_for_api = build_api_messages()
+    # 3. Payload para la API
+    messages_for_api = build_api_messages(include_file=not st.session_state.file_sent)
 
-    # 4. Llamada a la API con streaming (sin auto-continuación)
+    # 4. Llamada a la API (sin auto-continuación)
     client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
 
     try:
@@ -292,6 +353,7 @@ if prompt := st.chat_input("Escribe tu pregunta sobre el código..."):
             placeholder = st.empty()
             full_content, reasoning = "", ""
             finish_reason = None
+            usage = None
 
             kwargs = {
                 "model": model,
@@ -301,14 +363,11 @@ if prompt := st.chat_input("Escribe tu pregunta sobre el código..."):
             }
             if model != "deepseek-reasoner":
                 kwargs["temperature"] = temperature
-            # Pedir info de uso en el stream (DeepSeek lo soporta con stream_options)
             kwargs["stream_options"] = {"include_usage": True}
 
             stream = client.chat.completions.create(**kwargs)
 
-            usage = None
             for chunk in stream:
-                # El chunk de uso final puede venir sin choices
                 if getattr(chunk, "usage", None):
                     usage = chunk.usage
 
@@ -328,12 +387,12 @@ if prompt := st.chat_input("Escribe tu pregunta sobre el código..."):
                 if choice.finish_reason:
                     finish_reason = choice.finish_reason
 
-            # Aviso si se cortó (sin reintentar automáticamente)
+            # Aviso si se cortó (sin reintentar)
             if finish_reason == "length":
                 placeholder.markdown(
                     full_content
-                    + "\n\n---\n⚠️ *La respuesta se cortó por límite de tokens. "
-                      "Pide al modelo que continúe manualmente si lo necesitas.*"
+                    + "\n\n---\n⚠️ *La respuesta se cortó por límite de tokens "
+                      "(modo económico: 2048 tokens). Pide 'continúa' si lo necesitas.*"
                 )
             else:
                 placeholder.markdown(full_content)
@@ -357,6 +416,10 @@ if prompt := st.chat_input("Escribe tu pregunta sobre el código..."):
             "content": full_content,
             "reasoning": reasoning,
         })
+
+        # Marcar el archivo como ya enviado
+        if not st.session_state.file_sent and st.session_state.file_context:
+            st.session_state.file_sent = True
 
         st.rerun()
 
