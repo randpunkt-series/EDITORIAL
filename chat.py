@@ -39,7 +39,6 @@ if "file_sent" not in st.session_state:
     st.session_state.file_sent = False
 if "last_usage" not in st.session_state:
     st.session_state.last_usage = None
-# Aviso de recorte de historial
 if "history_truncated" not in st.session_state:
     st.session_state.history_truncated = False
 
@@ -254,7 +253,6 @@ with st.sidebar:
 
     st.divider()
 
-    # Modo económico: información visible
     st.info(
         "💰 **Modo económico activo**\n\n"
         f"- Prompt máx: {MAX_PROMPT_TOKENS:,} tokens\n"
@@ -263,7 +261,6 @@ with st.sidebar:
         f"- Sin auto-continuación"
     )
 
-    # Mostrar uso de tokens
     if st.session_state.last_usage:
         u = st.session_state.last_usage
         st.subheader("Uso de tokens (última llamada)")
@@ -286,7 +283,6 @@ with st.sidebar:
 st.title("🏡 Code Reviewer")
 st.caption("💰 Modo económico: respuestas concisas, contexto mínimo, máximo ahorro de tokens.")
 
-# Aviso si el historial se recortó
 if st.session_state.history_truncated:
     st.warning(
         "⚠️ El historial se ha recortado por límite de tokens. "
@@ -312,14 +308,12 @@ if prompt := st.chat_input("Escribe tu pregunta sobre el código..."):
         )
         st.stop()
 
-    # 1. Mensaje visible del usuario
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
         if uploaded_file is not None:
             st.caption(f"📎 Archivo adjunto: {uploaded_file.name}")
 
-    # 2. Si hay archivo NUEVO, extraerlo, resumirlo (agresivo) y guardarlo
     if uploaded_file is not None:
         if st.session_state.file_context_name != uploaded_file.name:
             client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
@@ -332,7 +326,6 @@ if prompt := st.chat_input("Escribe tu pregunta sobre el código..."):
                 )
                 file_content = file_content[:MAX_CHARS]
 
-            # Resumen agresivo si supera FILE_SUMMARY_THRESHOLD tokens
             if estimate_tokens(file_content) > FILE_SUMMARY_THRESHOLD:
                 with st.spinner("Generando resumen del archivo para ahorrar tokens..."):
                     file_content = summarize_file(client, file_content, model)
@@ -342,10 +335,8 @@ if prompt := st.chat_input("Escribe tu pregunta sobre el código..."):
             st.session_state.file_context_name = uploaded_file.name
             st.session_state.file_sent = False
 
-    # 3. Payload para la API
     messages_for_api = build_api_messages(include_file=not st.session_state.file_sent)
 
-    # 4. Llamada a la API (sin auto-continuación)
     client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
 
     try:
@@ -387,7 +378,6 @@ if prompt := st.chat_input("Escribe tu pregunta sobre el código..."):
                 if choice.finish_reason:
                     finish_reason = choice.finish_reason
 
-            # Aviso si se cortó (sin reintentar)
             if finish_reason == "length":
                 placeholder.markdown(
                     full_content
@@ -401,7 +391,6 @@ if prompt := st.chat_input("Escribe tu pregunta sobre el código..."):
                 with st.expander("🧠 Razonamiento del modelo"):
                     st.markdown(reasoning)
 
-        # Guardar uso de tokens
         if usage is not None:
             st.session_state.last_usage = {
                 "prompt_tokens": getattr(usage, "prompt_tokens", None),
@@ -417,7 +406,6 @@ if prompt := st.chat_input("Escribe tu pregunta sobre el código..."):
             "reasoning": reasoning,
         })
 
-        # Marcar el archivo como ya enviado
         if not st.session_state.file_sent and st.session_state.file_context:
             st.session_state.file_sent = True
 
