@@ -197,7 +197,7 @@ with st.sidebar:
     uploaded_file = st.file_uploader(
         "Sube tu archivo (código, PDF, DOCX o PNG)",
         type=[
-            "py", "txt", "tex", "js", "html", "css", "md", "json", "yml", "yaml", "sql",
+            "py", "txt", "tex", "js", "html", "css", "md", "json", "yml", "yaml", "sql", "cls"
             "pdf", "docx", "png",
         ],
         key=f"file_{st.session_state.uploader_key}",
